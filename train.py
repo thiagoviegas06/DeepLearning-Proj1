@@ -1,16 +1,19 @@
-"""Baseline ResNet with 5x5 convolutions for the Kaggle CIFAR-10 ResNet architecture challenge.
+"""CIFAR-style ResNet for the Kaggle CIFAR-10 ResNet architecture challenge (<= 5M parameters).
 
-Data (data/): 50,000 labeled 32x32 RGB training images (5,000 per class) and 2,000 unlabeled
-Kaggle test images. The labeled set is split per class into train / val / test (default
-35,000 / 7,500 / 7,500). Val picks the best epoch; the local test split is scored once at the end.
-The PNGs are decoded once into data/cache.npz, and the whole dataset lives on the device, with
-all augmentation (color jitter, rotation, crop + flip, cutout, mixup) done on the GPU.
+Depth, width and kernel size are flags; the default is the 5x5-conv ResNet-20 baseline (3.0M
+params). Data (data/): 50,000 labeled 32x32 RGB training images (5,000 per class) and 2,000
+unlabeled Kaggle test images. The labeled set is split per class into train / val / test (default
+40,000 / 5,000 / 5,000). Val picks the best epoch; the local test split is scored once at the end.
+The PNGs are decoded once into data/cache.npz, and the whole dataset lives on the device. All
+augmentation (color jitter, flip, pad-and-crop, Cutout, Mixup / CutMix) runs on the GPU per batch.
 
-  .venv/bin/python kaggle_resnet_cifar10/train.py                       # 100 epochs, early stopping
-  .venv/bin/python kaggle_resnet_cifar10/train.py --smoke               # CPU check, tiny subset
-  .venv/bin/python kaggle_resnet_cifar10/train.py --blocks 2 2 2 --width 16
+  python train.py                                   # 5x5 ResNet-20 baseline, 100 epochs, early stopping
+  python train.py --smoke                           # CPU check, tiny subset
+  python train.py --blocks 4 4 3 --width 64 --kernel 3 --epochs 200 --patience 0 \
+                  --label-smoothing 0.1 --cutout 16 --mix cutmix     # 4.7M-param recipe
 
 Writes OUT/history.json, summary.json, curves.png, best.pt and submission.csv (id,label).
+Run `python model_summary.py --run OUT` afterwards for the layer table, parameter count and test accuracy.
 """
 import argparse
 import csv
@@ -25,6 +28,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 HERE = Path(__file__).resolve().parent
+PARAM_LIMIT = 5_000_000  # competition rule: at most 5M trainable parameters
 
 
 def load_images(data_dir, cache):
@@ -123,28 +127,6 @@ def color_jitter(x, brightness, contrast, saturation):
     return x.clamp(0, 1)
 
 
-def rotate(x, degrees):
-    """Rotate each image by an angle drawn from U(-degrees, degrees), filling corners with zeros."""
-    n, dev = x.shape[0], x.device
-    theta = math.radians(degrees) * (2 * torch.rand(n, device=dev) - 1)
-    cos, sin, zero = theta.cos(), theta.sin(), torch.zeros(n, device=dev)
-    mat = torch.stack([torch.stack([cos, -sin, zero], 1), torch.stack([sin, cos, zero], 1)], 1)
-    grid = F.affine_grid(mat, list(x.shape), align_corners=False)
-    return F.grid_sample(x, grid, mode="bilinear", padding_mode="zeros", align_corners=False)
-
-
-def cutout(x, size):
-    """Zero one size x size square per image, centered anywhere in the image (so it may be clipped)."""
-    n, _, h, w = x.shape
-    dev = x.device
-    cy = torch.randint(0, h, (n, 1, 1), device=dev)
-    cx = torch.randint(0, w, (n, 1, 1), device=dev)
-    ys = torch.arange(h, device=dev)[None, :, None] - cy + size // 2
-    xs = torch.arange(w, device=dev)[None, None, :] - cx + size // 2
-    keep = ~((ys >= 0) & (ys < size) & (xs >= 0) & (xs < size))
-    return x * keep[:, None]
-
-
 def augment(x, pad=4):
     """Random horizontal flip + random crop with zero padding (zero = channel mean after normalizing)."""
     n, c, h, w = x.shape
@@ -156,6 +138,40 @@ def augment(x, pad=4):
     cols = torch.randint(0, 2 * pad + 1, (n, 1), device=dev) + torch.arange(w, device=dev)
     return x[torch.arange(n, device=dev)[:, None, None, None], torch.arange(c, device=dev)[None, :, None, None],
              rows[:, None, :, None], cols[:, None, None, :]]
+
+
+def cutout(x, size):
+    """Cutout (DeVries & Taylor, 2017): zero one size x size square per image, centered at a uniform
+    random pixel so it may be clipped by the border. Applied after normalization, so zero is the
+    per-channel mean."""
+    n, _, h, w = x.shape
+    dev = x.device
+    cy = torch.randint(0, h, (n, 1, 1), device=dev)
+    cx = torch.randint(0, w, (n, 1, 1), device=dev)
+    ys = torch.arange(h, device=dev)[None, :, None]
+    xs = torch.arange(w, device=dev)[None, None, :]
+    hole = (ys >= cy - size // 2) & (ys < cy + size // 2) & (xs >= cx - size // 2) & (xs < cx + size // 2)
+    return x.masked_fill(hole[:, None], 0.0)
+
+
+def mix_batch(x, y, mode, alpha):
+    """Mixup (Zhang et al., 2018) or CutMix (Yun et al., 2019) with one lambda ~ Beta(alpha, alpha)
+    per batch, pairing each image with a shuffled partner. Returns (x_mixed, y_a, y_b, lam); the
+    loss is lam * CE(y_a) + (1 - lam) * CE(y_b)."""
+    n, _, h, w = x.shape
+    perm = torch.randperm(n, device=x.device)
+    lam = torch.distributions.Beta(alpha, alpha).sample().item()
+    if mode == "mixup":
+        return lam * x + (1 - lam) * x[perm], y, y[perm], lam
+    # cutmix: paste a random box of the partner image whose area is (1 - lam) of the image,
+    # then set lam to the exact unpasted fraction (the box can be clipped by the border).
+    rh, rw = int(h * math.sqrt(1 - lam)), int(w * math.sqrt(1 - lam))
+    cy, cx = torch.randint(0, h, (1,)).item(), torch.randint(0, w, (1,)).item()
+    y1, y2 = max(cy - rh // 2, 0), min(cy + rh // 2, h)
+    x1, x2 = max(cx - rw // 2, 0), min(cx + rw // 2, w)
+    x = x.clone()
+    x[:, :, y1:y2, x1:x2] = x[perm, :, y1:y2, x1:x2]
+    return x, y, y[perm], 1 - (y2 - y1) * (x2 - x1) / (h * w)
 
 
 @torch.no_grad()
@@ -206,8 +222,7 @@ def main():
     p.add_argument("--out", type=Path, default=HERE / "runs" / "baseline")
     p.add_argument("--blocks", type=int, nargs="+", default=[3, 3, 3], help="basic blocks per stage")
     p.add_argument("--width", type=int, default=32, help="channels in the first stage")
-    p.add_argument("--kernel", type=int, default=5)
-    p.add_argument("--max-params", type=int, default=5_000_000, help="refuse larger models (0 = no limit)")
+    p.add_argument("--kernel", type=int, default=5, help="conv kernel size in the stem and every block")
     p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--patience", type=int, default=20,
                    help="stop after this many epochs without a new best val accuracy (0 = off)")
@@ -217,12 +232,14 @@ def main():
     p.add_argument("--warmup", type=float, default=1.0, help="linear warmup, in epochs")
     p.add_argument("--jitter", type=float, nargs=3, default=[0.2, 0.2, 0.2], metavar=("B", "C", "S"),
                    help="color jitter strength for brightness, contrast, saturation (0 0 0 = off)")
-    p.add_argument("--rotate", type=float, default=0.0, help="max random rotation in degrees (0 = off)")
-    p.add_argument("--cutout", type=int, default=0, help="side of the square cut out of each image (0 = off)")
-    p.add_argument("--mixup", type=float, default=0.0, help="mixup Beta(a, a) parameter (0 = off)")
-    p.add_argument("--label-smoothing", type=float, default=0.0)
-    p.add_argument("--val-frac", type=float, default=0.15)
-    p.add_argument("--test-frac", type=float, default=0.15)
+    p.add_argument("--label-smoothing", type=float, default=0.0, help="cross-entropy label smoothing (0 = off)")
+    p.add_argument("--cutout", type=int, default=0,
+                   help="side of the square hole Cutout zeroes in each training image (0 = off; 16 is standard for CIFAR)")
+    p.add_argument("--mix", choices=["none", "mixup", "cutmix"], default="none", help="batch mixing augmentation")
+    p.add_argument("--mix-alpha", type=float, default=1.0, help="mixing weight lambda ~ Beta(alpha, alpha)")
+    p.add_argument("--mix-prob", type=float, default=1.0, help="probability that a batch is mixed")
+    p.add_argument("--val-frac", type=float, default=0.1)
+    p.add_argument("--test-frac", type=float, default=0.1)
     p.add_argument("--seed", type=int, default=0, help="seeds both the split and training")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--smoke", action="store_true", help="1 epoch on 1,000 train images, tiny eval sets")
@@ -249,14 +266,14 @@ def main():
     y_train, y_val, y_test = (torch.from_numpy(y_all[i]).to(dev) for i in (tr, va, te))
 
     torch.manual_seed(args.seed)
-    rng = np.random.default_rng(args.seed)  # mixup coefficients
     model = ResNet(tuple(args.blocks), args.width, args.kernel).to(dev).to(memory_format=torch.channels_last)
     n_params = sum(q.numel() for q in model.parameters())
     depth = 2 * sum(args.blocks) + 2
     print(f"model: ResNet-{depth}, {args.kernel}x{args.kernel} convs, blocks {args.blocks}, "
           f"width {args.width}, {n_params:,} params, device {dev}")
-    if args.max_params and n_params > args.max_params:
-        raise SystemExit(f"{n_params:,} params exceeds --max-params {args.max_params:,}")
+    if n_params > PARAM_LIMIT:
+        raise SystemExit(f"{n_params:,} parameters exceeds the competition limit of {PARAM_LIMIT:,}")
+    criterion = lambda logits, y: F.cross_entropy(logits, y, label_smoothing=args.label_smoothing)
 
     decay = [q for q in model.parameters() if q.ndim > 1]
     no_decay = [q for q in model.parameters() if q.ndim <= 1]
@@ -277,31 +294,25 @@ def main():
         correct = torch.zeros((), device=dev)
         for i in range(0, len(perm), args.batch):
             idx = perm[i:i + args.batch]
-            xb = norm(color_jitter(x_train[idx], *args.jitter))
-            if args.rotate:
-                xb = rotate(xb, args.rotate)
-            xb = augment(xb)
+            # jitter on [0, 1] pixels -> normalize -> flip + crop -> Cutout -> Mixup / CutMix
+            xb = augment(norm(color_jitter(x_train[idx], *args.jitter)))
             if args.cutout:
                 xb = cutout(xb, args.cutout)
-            yb = y_train[idx]
-            lam, yb2 = 1.0, yb
-            if args.mixup:
-                lam = float(rng.beta(args.mixup, args.mixup))
-                mix = torch.randperm(len(idx), device=dev)
-                xb, yb2 = lam * xb + (1 - lam) * xb[mix], yb[mix]
+            ya = yb = y_train[idx]
+            lam = 1.0
+            if args.mix != "none" and torch.rand(()).item() < args.mix_prob:
+                xb, ya, yb, lam = mix_batch(xb, ya, args.mix, args.mix_alpha)
             xb = xb.contiguous(memory_format=torch.channels_last)
             with torch.autocast(dev.type, dtype=torch.bfloat16, enabled=amp):
-                logits = model(xb)
-            ce = lambda t: F.cross_entropy(logits.float(), t, label_smoothing=args.label_smoothing)
-            loss = lam * ce(yb) + (1 - lam) * ce(yb2) if args.mixup else ce(yb)
-            if lam < 0.5:
-                yb = yb2  # train accuracy counts the dominant label of each mixed pair
+                logits = model(xb).float()
+            loss = criterion(logits, ya) if lam == 1.0 else lam * criterion(logits, ya) + (1 - lam) * criterion(logits, yb)
             opt.zero_grad(set_to_none=True)
             loss.backward()
             opt.step()
             sched.step()
             loss_sum += loss.detach() * len(idx)
-            correct += (logits.argmax(1) == yb).sum()
+            pred = logits.argmax(1)  # on a mixed batch, credit each image's two labels by their weights
+            correct += lam * (pred == ya).sum() + (1 - lam) * (pred == yb).sum()
         val_loss, val_acc = evaluate(model, x_val, y_val, 1000, amp)
         h = {"epoch": epoch, "train_loss": loss_sum.item() / len(x_train), "train_acc": correct.item() / len(x_train),
              "val_loss": val_loss, "val_acc": val_acc, "lr": opt.param_groups[0]["lr"], "seconds": time.time() - t_ep}
