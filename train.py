@@ -185,6 +185,7 @@ def main():
     p.add_argument("--blocks", type=int, nargs="+", default=[3, 3, 3], help="basic blocks per stage")
     p.add_argument("--width", type=int, default=32, help="channels in the first stage")
     p.add_argument("--kernel", type=int, default=5)
+    p.add_argument("--max-params", type=int, default=5_000_000, help="refuse larger models (0 = no limit)")
     p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--patience", type=int, default=20,
                    help="stop after this many epochs without a new best val accuracy (0 = off)")
@@ -227,6 +228,8 @@ def main():
     depth = 2 * sum(args.blocks) + 2
     print(f"model: ResNet-{depth}, {args.kernel}x{args.kernel} convs, blocks {args.blocks}, "
           f"width {args.width}, {n_params:,} params, device {dev}")
+    if args.max_params and n_params > args.max_params:
+        raise SystemExit(f"{n_params:,} params exceeds --max-params {args.max_params:,}")
 
     decay = [q for q in model.parameters() if q.ndim > 1]
     no_decay = [q for q in model.parameters() if q.ndim <= 1]
