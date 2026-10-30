@@ -17,12 +17,14 @@
 #   sbatch kaggle_resnet_cifar10/train.sbatch
 #   OUT=kaggle_resnet_cifar10/runs/e200 ARGS="--epochs 200 --patience 0" sbatch --export=ALL kaggle_resnet_cifar10/train.sbatch
 #
-# Writes OUT/summary.json, history.json, curves.png, best.pt and submission.csv.
+# Without OUT the run goes to kaggle_resnet_cifar10/runs/YYYYMMDD_HHMMSS/ (job start time, e.g.
+# runs/20261029_225524). Writes OUT/summary.json, history.json, curves.png, best.pt and submission.csv.
 set -euo pipefail
 ROOT=/scratch/tjv235/deep_learning
 SIF="${SIF:-/share/apps/images/cuda12.1.1-cudnn8.9.0-devel-ubuntu22.04.2.sif}"
 OVERLAY="${OVERLAY:-/scratch/tjv235/neuro3.ext3}"
-OUT="${OUT:-$ROOT/kaggle_resnet_cifar10/runs/baseline_${SLURM_JOB_ID:-local}}"
+STAMP="$(date +%Y%m%d_%H%M%S)"   # job start time; the Slurm job id is echoed below for cross-reference
+OUT="${OUT:-$ROOT/kaggle_resnet_cifar10/runs/$STAMP}"
 ARGS="${ARGS:-}"
 
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-4}"
