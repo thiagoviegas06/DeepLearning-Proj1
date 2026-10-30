@@ -1,16 +1,14 @@
-# Small ResNets under 5M parameters: Kaggle CIFAR-10 challenge
+# ResNet-24 under 5M parameters: Kaggle CIFAR-10 challenge
 
-A CIFAR-style ResNet for a Kaggle CIFAR-10 ResNet architecture challenge whose one hard rule is
-**at most 5 million trainable parameters**, trained from scratch. Depth, width and kernel size are
-flags. The first model used **5×5 kernels everywhere** (ResNet-20, 3.0M params); the current recipe is
-a **3×3 ResNet-24 with stage widths 64/128/256 (4.70M params)** trained for 200 epochs with label
-smoothing, Cutout and CutMix. The training pipeline is a single PyTorch script that keeps the whole
-dataset on the GPU and runs augmentation there too, so a 100-epoch ResNet-20 run takes about
-6.5 minutes on one A100.
+A CIFAR-style ResNet for a Kaggle CIFAR-10 architecture challenge whose one hard rule is **at most
+5 million trainable parameters**, trained from scratch on the provided data only. The model is a
+**3×3 ResNet-24 with stage widths 64/128/256 (4,697,162 parameters)** trained for 200 epochs with SGD,
+a cosine schedule, label smoothing, Cutout and CutMix. The whole pipeline is one PyTorch script that
+keeps the dataset on the GPU and runs augmentation there too, so a full 200-epoch run takes about
+13 minutes on one A100.
 
-**Best result so far:** **88% on the Kaggle hidden test set** with the 4.70M-parameter 3×3 ResNet-24
-recipe, up from 82% with the 5×5 ResNet-20 baseline (`runs/baseline_21368912`, which scored 93.44% val
-and 92.74% on the local held-out split). See [Recent changes](#recent-changes) for what moved the score.
+**Result:** 96.66% validation accuracy, 96.50% on the local held-out split, and **0.88 on the Kaggle
+hidden test set**. See [Results](#results) and [Recent changes](#recent-changes).
 
 ## Competition rules this code enforces
 
@@ -55,65 +53,61 @@ The labeled set is split **per class** with a fixed seed into:
 
 ```
 input 3×32×32
-└─ stem: conv k×k(3→w) · BN · ReLU
-   ├─ stage 1: n1 × BasicBlock(w),   32×32
-   ├─ stage 2: n2 × BasicBlock(2w),  16×16   (first block stride 2)
-   └─ stage 3: n3 × BasicBlock(4w),   8×8    (first block stride 2)
-      └─ global average pool · linear(4w → 10)
+└─ stem: conv 3×3 (3→64) · BN · ReLU
+   ├─ stage 1: 4 × BasicBlock(64),   32×32
+   ├─ stage 2: 4 × BasicBlock(128),  16×16   (first block stride 2)
+   └─ stage 3: 3 × BasicBlock(256),   8×8    (first block stride 2)
+      └─ global average pool · linear(256 → 10)
 ```
 
-Each `BasicBlock` is conv k×k · BN · ReLU · conv k×k · BN, plus a shortcut, then ReLU (the residual
+Each `BasicBlock` is conv 3×3 · BN · ReLU · conv 3×3 · BN, plus a shortcut, then ReLU (the residual
 block from the project handout). The shortcut is the identity, or a 1×1 conv + BN projection when the
-stride or channel count changes. Depth is `2·sum(blocks) + 2`. Blocks per stage (`--blocks`), base
-width (`--width`) and kernel size (`--kernel`) are flags; `train.py` exits if the result has more than
-5M parameters. Parameter counts, from `model_summary.py`:
+stride or channel count changes. Depth is `2·sum(blocks) + 2 = 24`. The network is ResNet-18 with its
+last (512-channel) stage removed and one extra block in each of the first two stages, which spends the
+parameter budget on depth and width at 32×32 and 16×16 resolution.
 
-| Config | Flags | Params | Under 5M |
+Blocks per stage (`--blocks`), base width (`--width`) and kernel size (`--kernel`) are flags, and
+`train.py` exits if the chosen configuration has more than 5M parameters. The layer table from
+`python model_summary.py --blocks 4 4 3 --width 64 --kernel 3`:
+
+| Layer | Description | Output | Params |
 |---|---|---|---|
-| 5×5 ResNet-20 (baseline, the defaults) | `--blocks 3 3 3 --width 32 --kernel 5` | 2,986,666 | yes |
-| 5×5 ResNet-20, wider | `--blocks 3 3 3 --width 40 --kernel 5` | 4,664,530 | yes |
-| **3×3 ResNet-24, widths 64/128/256 (current recipe)** | `--blocks 4 4 3 --width 64 --kernel 3` | **4,697,162** | yes |
-| 5×5 ResNet-24, width 40 | `--blocks 4 4 3 --width 40 --kernel 5` | 5,065,010 | no |
-
-The 3×3 ResNet-24 is ResNet-18 with its last (512-channel) stage removed and one extra block in each
-of the first two stages: that spends the budget on depth and width at 32×32 and 16×16 resolution
-instead of on a single 512-channel stage.
+| stem | Conv 3×3 3→64 + BN + ReLU | 64×32×32 | 1,856 |
+| layers.0–3 | 4 × BasicBlock 64→64, identity shortcut | 64×32×32 | 4 × 73,984 |
+| layers.4 | BasicBlock 64→128, stride 2, 1×1 projection | 128×16×16 | 230,144 |
+| layers.5–7 | 3 × BasicBlock 128→128, identity shortcut | 128×16×16 | 3 × 295,424 |
+| layers.8 | BasicBlock 128→256, stride 2, 1×1 projection | 256×8×8 | 919,040 |
+| layers.9–10 | 2 × BasicBlock 256→256, identity shortcut | 256×8×8 | 2 × 1,180,672 |
+| head | global average pool + Linear 256→10 | 10 | 2,570 |
+| **total** | | | **4,697,162** (302,838 under the limit) |
 
 ## Training recipe
 
 | | |
 |---|---|
+| Model | `--blocks 4 4 3 --width 64 --kernel 3` (ResNet-24, 4,697,162 params) |
 | Optimizer | SGD, Nesterov momentum 0.9, lr 0.1, batch 128 |
 | Weight decay | 5e-4 on conv/linear weights only (none on BN or biases) |
-| Schedule | 1 epoch of linear warmup, then cosine decay to 0 |
+| Schedule | 1 epoch of linear warmup, then cosine decay to 0, stepped per batch |
+| Epochs | 200, no early stopping (`--patience 0`), so the full cosine schedule runs |
 | Augmentation (GPU) | color jitter (brightness/contrast/saturation ±0.2), random horizontal flip, 4-px zero-pad random crop |
+| Cutout | one random 16×16 square per image zeroed after normalization (`--cutout 16`) |
+| CutMix | a random box from a shuffled partner image is pasted in and the labels are mixed by area, λ ~ Beta(1, 1), every batch (`--mix cutmix`) |
+| Label smoothing | 0.1 (`--label-smoothing 0.1`) |
 | Normalization | per-channel mean/std computed on the training split |
 | Precision | bfloat16 autocast + channels-last on CUDA; float32 on Apple GPUs (MPS) and CPU |
-| Epochs | 100, early stopping after 20 epochs without a new best val accuracy |
 
-The checkpoint with the best val accuracy is reloaded at the end to score the local test split and
-write `submission.csv`.
+All augmentation runs on the GPU inside the training loop, per batch, in this order: color jitter on
+[0, 1] pixels → normalize → flip + crop → Cutout → CutMix. The loss is
+`λ · CE(y_a) + (1 − λ) · CE(y_b)` with label smoothing inside each term. Because the training targets
+are soft and mixed, the training loss and accuracy in `history.json` are not directly comparable to
+the val numbers. `--mix mixup` swaps CutMix for Mixup, and `--mix-alpha` / `--mix-prob` control the
+Beta parameter and the fraction of mixed batches.
 
-### Regularization flags (off by default, on in the current recipe)
+The checkpoint with the best val accuracy is reloaded at the end to score the local test split exactly
+once and to write `submission.csv`.
 
-The baseline reaches 99.97% train accuracy while val loss creeps back up, so the second round adds
-regularization. All of it runs on the GPU inside the training loop; the flags default to off so the
-tracked baseline runs stay reproducible.
-
-| Flag | Recipe value | What it does |
-|---|---|---|
-| `--label-smoothing` | 0.1 | cross-entropy against soft targets (Szegedy et al., 2016) |
-| `--cutout` | 16 | zeroes one random 16×16 square per image after normalization (DeVries & Taylor, 2017) |
-| `--mix` | `cutmix` | `cutmix` pastes a random box from a shuffled partner image and mixes the labels by area (Yun et al., 2019); `mixup` blends whole images (Zhang et al., 2018) |
-| `--mix-alpha` | 1.0 | mixing weight λ ~ Beta(α, α), one λ per batch |
-| `--mix-prob` | 1.0 | fraction of batches that are mixed |
-| `--epochs 200 --patience 0` | | run the full cosine schedule; with CutMix the best epoch is near the end |
-
-Per-batch order: color jitter on [0, 1] pixels → normalize → flip + crop → Cutout → Mixup / CutMix.
-With label smoothing or mixing on, the training loss and accuracy in `history.json` are measured
-against the soft / mixed targets, so they are not directly comparable to the val numbers.
-
-The full current recipe:
+The full recipe:
 
 ```bash
 python train.py --blocks 4 4 3 --width 64 --kernel 3 --epochs 200 --patience 0 \
@@ -123,46 +117,42 @@ python model_summary.py --run runs/resnet24_cutmix     # parameter count, layer 
 
 ## Results
 
-| Run | Epochs | Color jitter | Best epoch | Val acc | Local test acc | Train time (A100) |
-|---|---|---|---|---|---|---|
-| `baseline_21361893` | 30 | off | 29 | 91.62% | 92.14% | 75 s |
-| `baseline_21368912` | 100 | 0.2 / 0.2 / 0.2 | 90 | **93.44%** | **92.74%** | 390 s |
+ResNet-24, 4,697,162 parameters, the recipe above, seed 0, one A100 (also the executed run in
+`train_notebook.ipynb`):
 
-Training curves for the 100-epoch run:
+| Metric | Value |
+|---|---|
+| Epochs run / best epoch | 200 / 194 |
+| Train accuracy, last epoch (against CutMix + smoothed targets) | 72.6% |
+| Val accuracy (best epoch) | **96.66%** |
+| Local held-out test accuracy (scored once with `best.pt`) | **96.50%** |
+| Kaggle hidden test set | **0.88** |
+| Training time | 766 s (3.8 s / epoch) |
 
-![training curves](runs/baseline_21368912/curves.png)
-
-Training accuracy reaches 99.97% by the end, while val loss bottoms out and then creeps back up. That
-observation led to the regularization round described in the next section.
-
-### Kaggle hidden test set
-
-| Model | Params | Recipe | Kaggle score |
-|---|---|---|---|
-| 5×5 ResNet-20 (`baseline_21368912`) | 2,986,666 | 100 epochs, jitter + flip + crop | 0.82 |
-| 3×3 ResNet-24, widths 64/128/256 | 4,697,162 | 200 epochs, + label smoothing, Cutout, CutMix | **0.88** |
-
-The local held-out split is an optimistic estimate: the baseline scored 92.74% locally but 82% on
-Kaggle, so the hidden images are drawn from a harder or shifted distribution. Changes that improve
-generalization therefore show up more on Kaggle than on the local split. The run directory, val and
-local test accuracy of the ResNet-24 run will be added to the table above when it is committed.
+The train accuracy is low by construction: it is measured against mixed, smoothed targets on heavily
+augmented images, not against the clean labels. On the local test split the remaining errors are
+mostly cat ↔ dog confusions, followed by cat/bird/deer. The Kaggle hidden set scores lower than the
+local split, so the local number is an optimistic estimate.
 
 ## Recent changes
 
-Second round of the project: the Kaggle score went from **0.82 to 0.88**. Five things changed; all are
-flags in `train.py`, and the exact command is in [Training recipe](#training-recipe).
+Second round of the project. The first version was a 5×5 ResNet-20 (`--blocks 3 3 3 --width 32
+--kernel 5`, 2,986,666 params) trained for 100 epochs with early stopping and only color jitter, flip
+and crop as augmentation; it scored 0.82 on Kaggle. Five things changed, all of them flags in
+`train.py`, and the exact command is in [Training recipe](#training-recipe).
 
-1. **A bigger, better-shaped network** (`--blocks 4 4 3 --width 64 --kernel 3`). The baseline used 5×5
-   filters and only 3.0M of the 5M-parameter budget. The new model uses standard 3×3 filters, is one
-   stage deeper per early block, and is twice as wide at the 32×32 and 16×16 resolutions, for 4.70M
-   parameters. Two stacked 3×3 convolutions cover the same area as one 5×5 with fewer weights and an
-   extra nonlinearity, so the same budget buys more useful capacity, and the wider early stages give
-   more detectors for the fine textures that separate cat from dog or truck from automobile.
+1. **A bigger, better-shaped network** (`--blocks 4 4 3 --width 64 --kernel 3`). The previous model
+   used 5×5 filters and only 3.0M of the 5M-parameter budget. The new one uses standard 3×3 filters,
+   has one more block in each of the first two stages, and is twice as wide at the 32×32 and 16×16
+   resolutions, for 4.70M parameters. Two stacked 3×3 convolutions cover the same area as one 5×5
+   with fewer weights and an extra nonlinearity, so the same budget buys more useful capacity, and the
+   wider early stages give more detectors for the fine textures that separate cat from dog or truck
+   from automobile.
 
 2. **Label smoothing** (`--label-smoothing 0.1`). Instead of training the network to be 100% certain
    of the correct class, it is trained to be 90% certain with the rest spread over the other classes.
-   This stops it from becoming overconfident on training images, which makes its predictions better
-   calibrated and more accurate on images it has never seen.
+   This stops it from becoming overconfident on training images and gives better-calibrated
+   predictions on images it has never seen.
 
 3. **Cutout** (`--cutout 16`). A random 16×16 square of every training image is blanked out. The
    network can no longer rely on a single telltale spot, such as a wheel or a beak, and has to use the
@@ -178,35 +168,52 @@ flags in `train.py`, and the exact command is in [Training recipe](#training-rec
    lets the learning rate decay smoothly to zero. With CutMix the best epoch is almost always near the
    end, so early stopping was turned off.
 
-Why the gain is larger on Kaggle than locally: every item after the first is a regularizer. They
-penalize memorizing the training set and reward features that transfer, which is exactly what a
-shifted hidden test set rewards.
+The motivation was that the previous model reached 99.97% train accuracy while its val loss crept
+back up, and it scored 92.74% on the local held-out split but only 0.82 on Kaggle. Everything after
+item 1 is a regularizer: it penalizes memorizing the training set and rewards features that transfer,
+which is what a shifted hidden test set rewards. The gain is therefore larger on Kaggle than locally.
 
 What did not change: SGD with Nesterov momentum, learning rate 0.1, weight decay 5e-4, batch 128, one
-warmup epoch then cosine decay, the 40k/5k/5k split, color jitter, and flip-and-crop were all already
-in the baseline. The new flags default to off, so the baseline runs in the table above still reproduce.
-Alongside the recipe, `model_summary.py` was added to print the layer table, the trainable-parameter
-count against the 5M limit, and a run's final test accuracy, and `train.py` now refuses to train a
-model over the limit.
+warmup epoch then cosine decay, the 40k/5k/5k split, color jitter, and flip-and-crop. The new flags
+default to off, so the earlier runs in `runs/` still reproduce. Alongside the recipe, `model_summary.py`
+was added to print the layer table, the trainable-parameter count against the 5M limit and a run's
+final test accuracy, `train.py` now refuses to train a model over the limit, and `train_notebook.ipynb`
+was added to drive the script and inspect a run.
 
 ## Usage
 
 ```bash
-# full run: 100 epochs with early stopping, writes runs/baseline/
-python train.py
+# current recipe, writes runs/resnet24_cutmix/
+python train.py --blocks 4 4 3 --width 64 --kernel 3 --epochs 200 --patience 0 \
+                --label-smoothing 0.1 --cutout 16 --mix cutmix --out runs/resnet24_cutmix
 
 # quick CPU sanity check: 1 epoch on 1,000 images
-python train.py --smoke
+python train.py --smoke --out runs/smoke
 
-# other variants
+# variants: every hyperparameter is a flag, see `python train.py -h`
 python train.py --blocks 2 2 2 --width 16
-python train.py --epochs 200 --patience 0 --jitter 0 0 0 --out runs/e200
 python train.py --mix mixup --mix-alpha 0.4 --cutout 0          # Mixup instead of CutMix, no Cutout
 
 # model card for any config (before training) or any finished run
 python model_summary.py --blocks 4 4 3 --width 64 --kernel 3
-python model_summary.py --run runs/baseline_21368912
+python model_summary.py --run runs/resnet24_cutmix
 ```
+
+`train_notebook.ipynb` runs the same recipe through `train.py` (its `CONFIG` keys are the flag names),
+then plots the curves, the confusion matrix and per-class accuracy on the local test split, and the
+predicted class distribution on the Kaggle images. It also calls `model_summary.report(...)` so the
+parameter count and final test accuracy are printed in the executed notebook.
+
+Every run writes these files to `--out`:
+
+- `submission.csv`: Kaggle predictions (`id,label`)
+- `summary.json`: config, parameter count, best epoch, val and test accuracy, predicted class counts
+- `history.json`: per-epoch train/val loss and accuracy, learning rate, epoch time
+- `curves.png`: loss and accuracy plots
+- `best.pt`: best checkpoint, with the normalization stats and args (not tracked in git)
+
+Requirements: Python 3.9+ (3.12 on the cluster), PyTorch, NumPy, Pillow, and matplotlib.
+`torchinfo` is optional: if installed, `model_summary.py` prints its parameter count as a cross-check.
 
 ### NYU HPC
 
@@ -224,49 +231,21 @@ mkdir -p slurm_logs
 Submit from that directory; it becomes the job's root, and the venv in it is used:
 
 ```bash
-sbatch kaggle_resnet_cifar10/train.sbatch
-OUT=kaggle_resnet_cifar10/runs/e200 ARGS="--epochs 200 --patience 0" sbatch --export=ALL kaggle_resnet_cifar10/train.sbatch
-# current recipe (3x3 ResNet-24, 4.70M params, 200 epochs, label smoothing + Cutout + CutMix)
 OUT=kaggle_resnet_cifar10/runs/resnet24_cutmix \
 ARGS="--blocks 4 4 3 --width 64 --kernel 3 --epochs 200 --patience 0 --label-smoothing 0.1 --cutout 16 --mix cutmix" \
 sbatch --export=ALL --time=01:30:00 kaggle_resnet_cifar10/train.sbatch
 ```
 
-The wider 3×3 model does roughly twice the work per epoch of the 5×5 ResNet-20, so a 200-epoch run
-needs more than the job file's default 45 minutes; the `--time` override above covers it.
+The job file's default time limit is 45 minutes, so the 200-epoch run needs the `--time` override
+above. It uses the course allocation (`--account`, `--partition`); pass different ones on the `sbatch`
+command line if needed. `PY`, `OVERLAY`, `SIF`, `OUT` and `ARGS` environment variables override the
+Python used, wrap it in a Singularity container, and set the run directory and flags. Logs land in
+`slurm_logs/`; each run's outputs land in `OUT`. When `OUT` is not set, the job writes to
+`runs/YYYYMMDD_HHMMSS/`, named by the job's start time. The two original 5×5 ResNet-20 runs predate
+this scheme and have no recorded start time: `runs/20261029_225523/` (Slurm job 21361893, 30 epochs)
+and `runs/20261029_225524/` (job 21368912, 100 epochs) carry the files' creation time on disk, in job
+order, not the real training time.
 
-The job file uses the course allocation (`--account`, `--partition`); pass different ones on the
-`sbatch` command line if needed. `PY`, `OVERLAY`, `SIF`, `OUT` and `ARGS` environment variables
-override the Python used, wrap it in a Singularity container, and set the run directory and flags.
-Logs land in `slurm_logs/`; each run's outputs land in `OUT`.
-
-Every run writes these files to `--out`:
-
-- `submission.csv`: Kaggle predictions (`id,label`)
-- `summary.json`: config, parameter count, best epoch, val and test accuracy, predicted class counts
-- `history.json`: per-epoch train/val loss and accuracy, learning rate, epoch time
-- `curves.png`: loss and accuracy plots
-- `best.pt`: best checkpoint, with the normalization stats and args (not tracked in git)
-
-Requirements: Python 3.9+ (3.12 on the cluster), PyTorch, NumPy, Pillow, and matplotlib.
-`torchinfo` is optional: if installed, `model_summary.py` prints its parameter count as a cross-check.
-
-### Running on a Mac (Apple GPU)
-
-On an Apple-silicon Mac the script uses the GPU through PyTorch's MPS backend automatically; no CUDA
-is needed. The stock PyTorch wheel includes MPS support:
-
-```bash
-python3 -m venv .venv && source .venv/bin/activate
-pip install torch numpy pillow matplotlib
-python train.py --smoke --out runs/smoke   # quick check; prints "device mps"
-python train.py                            # full run on the Apple GPU
-```
-
-The device is picked in the order CUDA, MPS, CPU; override with `--device cpu`. MPS runs in
-float32 (no bfloat16 autocast). Measured on an M3 Pro: about 41 s per epoch at batch 128, so a
-100-epoch run takes roughly 70 minutes versus 6.5 minutes on an A100. Use the cluster for sweeps
-and the Mac for development and short runs (`--epochs 30` finishes in about 20 minutes).
 
 ## References
 
