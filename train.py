@@ -2,9 +2,9 @@
 
 Data (data/): 50,000 labeled 32x32 RGB training images (5,000 per class) and 2,000 unlabeled
 Kaggle test images. The labeled set is split per class into train / val / test (default
-40,000 / 5,000 / 5,000). Val picks the best epoch; the local test split is scored once at the end.
+35,000 / 7,500 / 7,500). Val picks the best epoch; the local test split is scored once at the end.
 The PNGs are decoded once into data/cache.npz, and the whole dataset lives on the device, with
-random crop + flip done on the GPU.
+all augmentation (color jitter, rotation, crop + flip, cutout, mixup) done on the GPU.
 
   .venv/bin/python kaggle_resnet_cifar10/train.py                       # 100 epochs, early stopping
   .venv/bin/python kaggle_resnet_cifar10/train.py --smoke               # CPU check, tiny subset
@@ -123,6 +123,28 @@ def color_jitter(x, brightness, contrast, saturation):
     return x.clamp(0, 1)
 
 
+def rotate(x, degrees):
+    """Rotate each image by an angle drawn from U(-degrees, degrees), filling corners with zeros."""
+    n, dev = x.shape[0], x.device
+    theta = math.radians(degrees) * (2 * torch.rand(n, device=dev) - 1)
+    cos, sin, zero = theta.cos(), theta.sin(), torch.zeros(n, device=dev)
+    mat = torch.stack([torch.stack([cos, -sin, zero], 1), torch.stack([sin, cos, zero], 1)], 1)
+    grid = F.affine_grid(mat, list(x.shape), align_corners=False)
+    return F.grid_sample(x, grid, mode="bilinear", padding_mode="zeros", align_corners=False)
+
+
+def cutout(x, size):
+    """Zero one size x size square per image, centered anywhere in the image (so it may be clipped)."""
+    n, _, h, w = x.shape
+    dev = x.device
+    cy = torch.randint(0, h, (n, 1, 1), device=dev)
+    cx = torch.randint(0, w, (n, 1, 1), device=dev)
+    ys = torch.arange(h, device=dev)[None, :, None] - cy + size // 2
+    xs = torch.arange(w, device=dev)[None, None, :] - cx + size // 2
+    keep = ~((ys >= 0) & (ys < size) & (xs >= 0) & (xs < size))
+    return x * keep[:, None]
+
+
 def augment(x, pad=4):
     """Random horizontal flip + random crop with zero padding (zero = channel mean after normalizing)."""
     n, c, h, w = x.shape
@@ -195,8 +217,12 @@ def main():
     p.add_argument("--warmup", type=float, default=1.0, help="linear warmup, in epochs")
     p.add_argument("--jitter", type=float, nargs=3, default=[0.2, 0.2, 0.2], metavar=("B", "C", "S"),
                    help="color jitter strength for brightness, contrast, saturation (0 0 0 = off)")
-    p.add_argument("--val-frac", type=float, default=0.1)
-    p.add_argument("--test-frac", type=float, default=0.1)
+    p.add_argument("--rotate", type=float, default=0.0, help="max random rotation in degrees (0 = off)")
+    p.add_argument("--cutout", type=int, default=0, help="side of the square cut out of each image (0 = off)")
+    p.add_argument("--mixup", type=float, default=0.0, help="mixup Beta(a, a) parameter (0 = off)")
+    p.add_argument("--label-smoothing", type=float, default=0.0)
+    p.add_argument("--val-frac", type=float, default=0.15)
+    p.add_argument("--test-frac", type=float, default=0.15)
     p.add_argument("--seed", type=int, default=0, help="seeds both the split and training")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--smoke", action="store_true", help="1 epoch on 1,000 train images, tiny eval sets")
@@ -223,6 +249,7 @@ def main():
     y_train, y_val, y_test = (torch.from_numpy(y_all[i]).to(dev) for i in (tr, va, te))
 
     torch.manual_seed(args.seed)
+    rng = np.random.default_rng(args.seed)  # mixup coefficients
     model = ResNet(tuple(args.blocks), args.width, args.kernel).to(dev).to(memory_format=torch.channels_last)
     n_params = sum(q.numel() for q in model.parameters())
     depth = 2 * sum(args.blocks) + 2
@@ -250,11 +277,25 @@ def main():
         correct = torch.zeros((), device=dev)
         for i in range(0, len(perm), args.batch):
             idx = perm[i:i + args.batch]
-            xb = augment(norm(color_jitter(x_train[idx], *args.jitter))).contiguous(memory_format=torch.channels_last)
+            xb = norm(color_jitter(x_train[idx], *args.jitter))
+            if args.rotate:
+                xb = rotate(xb, args.rotate)
+            xb = augment(xb)
+            if args.cutout:
+                xb = cutout(xb, args.cutout)
             yb = y_train[idx]
+            lam, yb2 = 1.0, yb
+            if args.mixup:
+                lam = float(rng.beta(args.mixup, args.mixup))
+                mix = torch.randperm(len(idx), device=dev)
+                xb, yb2 = lam * xb + (1 - lam) * xb[mix], yb[mix]
+            xb = xb.contiguous(memory_format=torch.channels_last)
             with torch.autocast(dev.type, dtype=torch.bfloat16, enabled=amp):
                 logits = model(xb)
-            loss = F.cross_entropy(logits.float(), yb)
+            ce = lambda t: F.cross_entropy(logits.float(), t, label_smoothing=args.label_smoothing)
+            loss = lam * ce(yb) + (1 - lam) * ce(yb2) if args.mixup else ce(yb)
+            if lam < 0.5:
+                yb = yb2  # train accuracy counts the dominant label of each mixed pair
             opt.zero_grad(set_to_none=True)
             loss.backward()
             opt.step()
