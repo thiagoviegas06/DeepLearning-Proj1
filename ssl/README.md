@@ -45,11 +45,16 @@ $PY ssl/predict.py --ckpt best_simclr-ft.pt
 kaggle competitions submit -c cifar-10-res-net-architecture-challenge-dl -f submission_simclr-ft.csv -m "..."
 ```
 
-## Results so far (pre-photometric-fix runs)
+## Results so far (pre-SSL-finetune runs)
 
 - Baseline (crop+flip only): 93.56% val (ep 73/100) → **0.828 Kaggle**
 - Team pipeline (their recipe): 96.01% val → **0.854 Kaggle**
 - Same ~11pt gap in both → shift hypothesis is consistent across pipelines.
+- **Photometric-aug retrain** (ColorJitter 0.3 + sharpness 2.0): 94.64% val (ep 95) → **0.855 Kaggle**.
+  Val +1.1 but Kaggle +2.7 vs v1 — the aug fix works where it matters. Confirms the shift.
+- **SSL fine-tune** (SimCLR 100ep pretrain → fine-tune w/ photometric aug): best val
+  **95.32% @ ep 94** (still climbing at commit time) — beats the supervised-only photometric
+  baseline by +0.7 on val. **First SSL result for the team.** Kaggle score TBD.
 
 ## Integration plan (next)
 
