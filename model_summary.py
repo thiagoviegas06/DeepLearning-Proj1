@@ -108,7 +108,9 @@ def report(blocks=None, width=None, kernel=None, run=None, torchinfo=True):
     ok = trainable <= train.PARAM_LIMIT
     print(f"TRAINABLE PARAMETERS: {trainable:,}  (limit {train.PARAM_LIMIT:,}: "
           f"{'OK' if ok else 'OVER THE LIMIT'}, {train.PARAM_LIMIT - trainable:+,} to spare)")
-    if summary is not None:
+    if summary is not None and summary["test_acc"] is None:
+        print(f"FINAL TEST ACCURACY:  n/a (trained on all labeled images, no local test split)  [{run}]")
+    elif summary is not None:
         print(f"FINAL TEST ACCURACY:  {summary['test_acc']:.4f}  "
               f"({summary['split']['test']:,} held-out local test images, best.pt from epoch "
               f"{summary['best_epoch']}, val acc {summary['best_val_acc']:.4f})  [{run}]")

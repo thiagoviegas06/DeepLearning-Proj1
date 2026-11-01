@@ -4,15 +4,17 @@ Depth, width and kernel size are flags; the default is the 5x5-conv ResNet-20 ba
 params). Data (data/): 50,000 labeled 32x32 RGB training images (5,000 per class) and 2,000
 unlabeled Kaggle test images. The labeled set is split per class into train / val / test (default
 40,000 / 5,000 / 5,000). Val picks the best epoch; the local test split is scored once at the end.
+With --val-frac 0 --test-frac 0 the model trains on all 50,000 and the last epoch is kept.
 The PNGs are decoded once into data/cache.npz, and the whole dataset lives on the device. All
-augmentation (color jitter, flip, pad-and-crop, Cutout, Mixup / CutMix) runs on the GPU per batch.
+augmentation (color jitter, sharpness, flip, pad-and-crop, Cutout, Mixup / CutMix) runs on the GPU
+per batch. The local test split and the Kaggle images are scored both plain and with flip TTA.
 
   python train.py                                   # 5x5 ResNet-20 baseline, 100 epochs, early stopping
   python train.py --smoke                           # CPU check, tiny subset
   python train.py --blocks 4 4 3 --width 64 --kernel 3 --epochs 200 --patience 0 \
                   --label-smoothing 0.1 --cutout 16 --mix cutmix     # 4.7M-param recipe
 
-Writes OUT/history.json, summary.json, curves.png, best.pt and submission.csv (id,label).
+Writes OUT/history.json, summary.json, curves.png, best.pt, submission.csv and submission_tta.csv (id,label).
 Run `python model_summary.py --run OUT` afterwards for the layer table, parameter count and test accuracy.
 """
 import argparse
@@ -127,6 +129,18 @@ def color_jitter(x, brightness, contrast, saturation):
     return x.clamp(0, 1)
 
 
+def sharpen(x, factor, prob):
+    """Like torchvision's RandomAdjustSharpness on [0, 1] pixels: with probability `prob` per image,
+    blend it with a 3x3-smoothed copy, out = blur + factor * (x - blur), so factor > 1 sharpens.
+    Border pixels are left unsmoothed, as in torchvision."""
+    k = torch.tensor([[1., 1., 1.], [1., 5., 1.], [1., 1., 1.]], device=x.device) / 13
+    blur = x.clone()
+    blur[:, :, 1:-1, 1:-1] = F.conv2d(x, k.expand(x.shape[1], 1, 3, 3), groups=x.shape[1])
+    out = (blur + factor * (x - blur)).clamp(0, 1)
+    apply = torch.rand(x.shape[0], device=x.device) < prob
+    return torch.where(apply[:, None, None, None], out, x)
+
+
 def augment(x, pad=4):
     """Random horizontal flip + random crop with zero padding (zero = channel mean after normalizing)."""
     n, c, h, w = x.shape
@@ -175,25 +189,37 @@ def mix_batch(x, y, mode, alpha):
 
 
 @torch.no_grad()
-def evaluate(model, x, y, batch, amp):
-    model.eval()
-    loss, correct = 0.0, 0
-    for i in range(0, len(x), batch):
-        with torch.autocast(x.device.type, dtype=torch.bfloat16, enabled=amp):
-            logits = model(x[i:i + batch]).float()
-        loss += F.cross_entropy(logits, y[i:i + batch], reduction="sum").item()
-        correct += (logits.argmax(1) == y[i:i + batch]).sum().item()
-    return loss / len(x), correct / len(x)
-
-
-@torch.no_grad()
-def predict(model, x, batch, amp):
+def logits_of(model, x, batch, amp, tta=False):
+    """Logits for x in batches; with tta, the average of the logits of each image and its mirror."""
     model.eval()
     out = []
     for i in range(0, len(x), batch):
+        xb = x[i:i + batch]
         with torch.autocast(x.device.type, dtype=torch.bfloat16, enabled=amp):
-            out.append(model(x[i:i + batch]).argmax(1))
+            z = model(xb).float()
+            if tta:
+                z = (z + model(xb.flip(3)).float()) / 2
+        out.append(z)
     return torch.cat(out)
+
+
+def evaluate(model, x, y, batch, amp, tta=False):
+    """(mean cross-entropy, accuracy); (nan, nan) for an empty split."""
+    if len(x) == 0:
+        return float("nan"), float("nan")
+    logits = logits_of(model, x, batch, amp, tta)
+    return F.cross_entropy(logits, y).item(), (logits.argmax(1) == y).float().mean().item()
+
+
+def predict(model, x, batch, amp, tta=False):
+    return logits_of(model, x, batch, amp, tta).argmax(1)
+
+
+def write_submission(path, ids, preds):
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["id", "label"])
+        w.writerows(zip(ids.tolist(), preds.tolist()))
 
 
 def plot(history, path):
@@ -232,13 +258,16 @@ def main():
     p.add_argument("--warmup", type=float, default=1.0, help="linear warmup, in epochs")
     p.add_argument("--jitter", type=float, nargs=3, default=[0.2, 0.2, 0.2], metavar=("B", "C", "S"),
                    help="color jitter strength for brightness, contrast, saturation (0 0 0 = off)")
+    p.add_argument("--sharpness", type=float, default=0.0,
+                   help="sharpness factor for random sharpening, e.g. 2.0 (0 = off)")
+    p.add_argument("--sharpness-prob", type=float, default=0.5, help="probability that an image is sharpened")
     p.add_argument("--label-smoothing", type=float, default=0.0, help="cross-entropy label smoothing (0 = off)")
     p.add_argument("--cutout", type=int, default=0,
                    help="side of the square hole Cutout zeroes in each training image (0 = off; 16 is standard for CIFAR)")
     p.add_argument("--mix", choices=["none", "mixup", "cutmix"], default="none", help="batch mixing augmentation")
     p.add_argument("--mix-alpha", type=float, default=1.0, help="mixing weight lambda ~ Beta(alpha, alpha)")
     p.add_argument("--mix-prob", type=float, default=1.0, help="probability that a batch is mixed")
-    p.add_argument("--val-frac", type=float, default=0.1)
+    p.add_argument("--val-frac", type=float, default=0.1, help="0 = no val split; the last epoch is kept")
     p.add_argument("--test-frac", type=float, default=0.1)
     p.add_argument("--seed", type=int, default=0, help="seeds both the split and training")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -246,6 +275,7 @@ def main():
     args = p.parse_args()
     if args.smoke:
         args.epochs = 1
+    has_val = args.val_frac > 0
 
     t0 = time.time()
     x_all, y_all, x_kaggle, kaggle_ids = load_images(args.data, args.data / "cache.npz")
@@ -294,8 +324,11 @@ def main():
         correct = torch.zeros((), device=dev)
         for i in range(0, len(perm), args.batch):
             idx = perm[i:i + args.batch]
-            # jitter on [0, 1] pixels -> normalize -> flip + crop -> Cutout -> Mixup / CutMix
-            xb = augment(norm(color_jitter(x_train[idx], *args.jitter)))
+            # jitter + sharpness on [0, 1] pixels -> normalize -> flip + crop -> Cutout -> Mixup / CutMix
+            xb = color_jitter(x_train[idx], *args.jitter)
+            if args.sharpness:
+                xb = sharpen(xb, args.sharpness, args.sharpness_prob)
+            xb = augment(norm(xb))
             if args.cutout:
                 xb = cutout(xb, args.cutout)
             ya = yb = y_train[idx]
@@ -317,13 +350,13 @@ def main():
         h = {"epoch": epoch, "train_loss": loss_sum.item() / len(x_train), "train_acc": correct.item() / len(x_train),
              "val_loss": val_loss, "val_acc": val_acc, "lr": opt.param_groups[0]["lr"], "seconds": time.time() - t_ep}
         history.append(h)
-        if val_acc > best_acc:
+        if not has_val or val_acc > best_acc:  # without val, every epoch overwrites best.pt
             best_acc, best_epoch = val_acc, epoch
             torch.save({"model": model.state_dict(), "epoch": epoch, "args": vars(args) | {"data": str(args.data),
                         "out": str(args.out)}, "mean": mean.cpu(), "std": std.cpu()}, args.out / "best.pt")
         print(f"epoch {epoch:3d}  train {h['train_loss']:.4f} / {h['train_acc']:.4f}  "
               f"val {val_loss:.4f} / {val_acc:.4f}  lr {h['lr']:.4f}  {h['seconds']:.1f}s", flush=True)
-        if args.patience and epoch - best_epoch >= args.patience:
+        if has_val and args.patience and epoch - best_epoch >= args.patience:
             stopped_early = True
             print(f"early stop: no val improvement in {args.patience} epochs (best epoch {best_epoch})")
             break
@@ -332,22 +365,25 @@ def main():
     best = torch.load(args.out / "best.pt", map_location=dev)
     model.load_state_dict(best["model"])
     test_loss, test_acc = evaluate(model, x_test, y_test, 1000, amp)
+    _, test_acc_tta = evaluate(model, x_test, y_test, 1000, amp, tta=True)
     preds = predict(model, x_kag, 1000, amp).cpu().numpy()
-    with open(args.out / "submission.csv", "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["id", "label"])
-        w.writerows(zip(kaggle_ids.tolist(), preds.tolist()))
+    preds_tta = predict(model, x_kag, 1000, amp, tta=True).cpu().numpy()
+    write_submission(args.out / "submission.csv", kaggle_ids, preds)
+    write_submission(args.out / "submission_tta.csv", kaggle_ids, preds_tta)
 
-    summary = {"depth": depth, "params": n_params, "best_epoch": best["epoch"], "best_val_acc": best_acc,
-               "epochs_run": len(history), "stopped_early": stopped_early,
-               "test_loss": test_loss, "test_acc": test_acc, "train_seconds": train_seconds,
+    nan_to_none = lambda v: None if math.isnan(v) else v
+    summary = {"depth": depth, "params": n_params, "best_epoch": best["epoch"],
+               "best_val_acc": best_acc if has_val else None, "epochs_run": len(history), "stopped_early": stopped_early,
+               "test_loss": nan_to_none(test_loss), "test_acc": nan_to_none(test_acc),
+               "test_acc_tta": nan_to_none(test_acc_tta), "train_seconds": train_seconds,
                "split": {"train": len(tr), "val": len(va), "test": len(te)},
                "kaggle_pred_counts": np.bincount(preds, minlength=10).tolist(),
+               "kaggle_tta_changed": int((preds != preds_tta).sum()),
                "args": vars(args) | {"data": str(args.data), "out": str(args.out)}}
     (args.out / "history.json").write_text(json.dumps(history, indent=1))
     (args.out / "summary.json").write_text(json.dumps(summary, indent=1))
     plot(history, args.out / "curves.png")
-    print(f"best epoch {best['epoch']}: val {best_acc:.4f}  local test {test_acc:.4f}  "
+    print(f"best epoch {best['epoch']}: val {best_acc if has_val else float('nan'):.4f}  local test {test_acc:.4f} / {test_acc_tta:.4f} with TTA  "
           f"({train_seconds:.0f}s training) -> {args.out}")
 
 
