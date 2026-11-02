@@ -25,14 +25,12 @@ def main():
 
     dev = torch.device(a.device)
     amp = dev.type == "cuda"
-    ckpt = torch.load(a.run / "best.pt", map_location=dev)
+    model, ckpt = train.load_run(a.run / "best.pt", dev)
     args = ckpt["args"]
     data = a.data or Path(args["data"])
     x_all, y_all, x_kaggle, kaggle_ids = train.load_images(data, data / "cache.npz")
     _, _, te = train.stratified_split(y_all, args["val_frac"], args["test_frac"], args["seed"])
 
-    model = train.ResNet(tuple(args["blocks"]), args["width"], args["kernel"]).to(dev).to(memory_format=torch.channels_last)
-    model.load_state_dict(ckpt["model"])
     mean, std = ckpt["mean"].to(dev), ckpt["std"].to(dev)
     prep = lambda x: (torch.from_numpy(x).to(dev).permute(0, 3, 1, 2).float().div_(255) - mean) / std
     x_test, y_test, x_kag = prep(x_all[te]), torch.from_numpy(y_all[te]).to(dev), prep(x_kaggle)
