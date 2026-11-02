@@ -6,13 +6,19 @@ unlabeled Kaggle test images. The labeled set is split per class into train / va
 40,000 / 5,000 / 5,000). Val picks the best epoch; the local test split is scored once at the end.
 With --val-frac 0 --test-frac 0 the model trains on all 50,000 and the last epoch is kept.
 The PNGs are decoded once into data/cache.npz, and the whole dataset lives on the device. All
-augmentation (color jitter, sharpness, flip, pad-and-crop, Cutout, Mixup / CutMix) runs on the GPU
-per batch. The local test split and the Kaggle images are scored both plain and with flip TTA.
+augmentation (color jitter, sharpness, RandAugment, flip, pad-and-crop, Cutout, Mixup / CutMix) runs
+on the GPU per batch. The local test split and the Kaggle images are scored both plain and with flip TTA.
+
+Knowledge distillation: train a larger teacher first (it may exceed the 5M limit with
+--teacher-over-limit; it is never submitted), then train the student with --teacher TEACHER_RUN/best.pt.
+The teacher sees the same augmented batches and the student matches its softened predictions.
 
   python train.py                                   # 5x5 ResNet-20 baseline, 100 epochs, early stopping
   python train.py --smoke                           # CPU check, tiny subset
   python train.py --blocks 4 4 3 --width 64 --kernel 3 --epochs 200 --patience 0 \
                   --label-smoothing 0.1 --cutout 16 --mix cutmix     # 4.7M-param recipe
+  python train.py ... --width 128 --teacher-over-limit --out runs/teacher   # 18.8M-param teacher
+  python train.py ... --width 64 --teacher runs/teacher/best.pt             # distilled student
 
 Writes OUT/history.json, summary.json, curves.png, best.pt, submission.csv and submission_tta.csv (id,label).
 Run `python model_summary.py --run OUT` afterwards for the layer table, parameter count and test accuracy.
@@ -141,6 +147,70 @@ def sharpen(x, factor, prob):
     return torch.where(apply[:, None, None, None], out, x)
 
 
+def equalize(x):
+    """Per-image, per-channel histogram equalization of [0, 1] pixels, as in torchvision's equalize."""
+    v = (x * 255).round().long().flatten(2)
+    hist = torch.zeros(*v.shape[:2], 256, dtype=torch.long, device=x.device).scatter_add_(2, v, torch.ones_like(v))
+    last = hist.gather(2, ((hist > 0) * torch.arange(256, device=x.device)).argmax(2, keepdim=True))
+    step = (hist.sum(2, keepdim=True) - last) // 255
+    lut = (hist.cumsum(2) + step // 2) // step.clamp(min=1)
+    lut = torch.cat([torch.zeros_like(lut[..., :1]), lut[..., :-1]], 2).clamp(0, 255)
+    out = lut.gather(2, v).view_as(x).float() / 255
+    return torch.where(step[..., None] == 0, x, out)
+
+
+def rand_augment(x, n_ops, magnitude, bins=31):
+    """RandAugment (Cubuk et al., 2020) on [0, 1] pixels with torchvision's 14 ops and magnitude scales:
+    `n_ops` rounds, each applying an op drawn uniformly and independently per image, at `magnitude`
+    out of bins - 1 (9 of 30 is the usual CIFAR setting), with a random sign for the signed ops.
+    Geometric ops fill uncovered pixels with black, like torchvision."""
+    n, _, h, w = x.shape
+    dev = x.device
+    m = magnitude / (bins - 1)
+    gray = lambda t: (t * torch.tensor([0.299, 0.587, 0.114], device=dev)[:, None, None]).sum(1, keepdim=True)
+    blend = lambda a, b, f: (b + f * (a - b)).clamp(0, 1)  # f = 1 keeps a, f = 0 gives b
+    for _ in range(n_ops):
+        op = torch.randint(0, 14, (n,), device=dev)
+        sign = torch.where(torch.rand(n, device=dev) < 0.5, -1.0, 1.0)
+        # 0-4 geometric: shear x, shear y, translate x, translate y, rotate, as one affine resample
+        theta = torch.eye(2, 3, device=dev).repeat(n, 1, 1)
+        shear, shift, angle = 0.3 * m * sign, 2 * (150 / 331) * m * sign, math.radians(30 * m) * sign
+        theta[:, 0, 1] = torch.where(op == 0, shear, theta[:, 0, 1])
+        theta[:, 1, 0] = torch.where(op == 1, shear, theta[:, 1, 0])
+        theta[:, 0, 2] = torch.where(op == 2, shift, theta[:, 0, 2])
+        theta[:, 1, 2] = torch.where(op == 3, shift, theta[:, 1, 2])
+        rot = op == 4
+        theta[rot, :, :2] = torch.stack([torch.stack([angle.cos(), -angle.sin()], 1),
+                                         torch.stack([angle.sin(), angle.cos()], 1)], 1)[rot]
+        geo = op <= 4
+        if geo.any():
+            grid = F.affine_grid(theta[geo], [int(geo.sum()), *x.shape[1:]], align_corners=False)
+            x[geo] = F.grid_sample(x[geo], grid, mode="bilinear", padding_mode="zeros", align_corners=False)
+        # 5-8 brightness, color, contrast, sharpness: factor 1 +- 0.9 m
+        f = (1 + 0.9 * m * sign)[:, None, None, None]
+        color_ops = {5: lambda t, f: blend(t, torch.zeros_like(t), f),
+                     6: lambda t, f: blend(t, gray(t), f),
+                     7: lambda t, f: blend(t, gray(t).mean((2, 3), keepdim=True), f),
+                     8: lambda t, f: sharpen(t, f, 1.0)}
+        for k, fn in color_ops.items():
+            sel = op == k
+            if sel.any():
+                x[sel] = fn(x[sel], f[sel])
+        # 9 posterize, 10 solarize, 11 autocontrast, 12 equalize, 13 identity
+        bits = 8 - int(round(m * 4))
+        level = 2 ** (8 - bits)
+        lo, hi = x.amin((2, 3), keepdim=True), x.amax((2, 3), keepdim=True)
+        other_ops = {9: lambda t, lo, hi: torch.floor((t * 255).round() / level) * level / 255,
+                     10: lambda t, lo, hi: torch.where(t >= 1 - m, 1 - t, t),
+                     11: lambda t, lo, hi: torch.where(hi > lo, (t - lo) / (hi - lo).clamp(min=1e-8), t),
+                     12: lambda t, lo, hi: equalize(t)}
+        for k, fn in other_ops.items():
+            sel = op == k
+            if sel.any():
+                x[sel] = fn(x[sel], lo[sel], hi[sel])
+    return x
+
+
 def augment(x, pad=4):
     """Random horizontal flip + random crop with zero padding (zero = channel mean after normalizing)."""
     n, c, h, w = x.shape
@@ -222,6 +292,22 @@ def write_submission(path, ids, preds):
         w.writerows(zip(ids.tolist(), preds.tolist()))
 
 
+def load_run(path, dev):
+    """(model in eval mode, checkpoint dict) from a best.pt written by this script."""
+    ckpt = torch.load(path, map_location=dev)
+    a = ckpt["args"]
+    model = ResNet(tuple(a["blocks"]), a["width"], a["kernel"]).to(dev).to(memory_format=torch.channels_last)
+    model.load_state_dict(ckpt["model"])
+    return model.eval(), ckpt
+
+
+def kd_loss(student_logits, teacher_logits, temp):
+    """Hinton et al. (2015) distillation loss: KL(teacher || student) on temperature-softened
+    distributions, scaled by temp^2 so its gradients stay comparable to the cross-entropy's."""
+    return F.kl_div(F.log_softmax(student_logits / temp, 1), F.log_softmax(teacher_logits / temp, 1),
+                    reduction="batchmean", log_target=True) * temp ** 2
+
+
 def plot(history, path):
     import matplotlib
     matplotlib.use("Agg")
@@ -261,12 +347,20 @@ def main():
     p.add_argument("--sharpness", type=float, default=0.0,
                    help="sharpness factor for random sharpening, e.g. 2.0 (0 = off)")
     p.add_argument("--sharpness-prob", type=float, default=0.5, help="probability that an image is sharpened")
+    p.add_argument("--randaugment", type=int, nargs=2, default=[0, 0], metavar=("N", "M"),
+                   help="RandAugment: N ops per image at magnitude M of 30 (e.g. 2 9; 0 0 = off)")
     p.add_argument("--label-smoothing", type=float, default=0.0, help="cross-entropy label smoothing (0 = off)")
     p.add_argument("--cutout", type=int, default=0,
                    help="side of the square hole Cutout zeroes in each training image (0 = off; 16 is standard for CIFAR)")
     p.add_argument("--mix", choices=["none", "mixup", "cutmix"], default="none", help="batch mixing augmentation")
     p.add_argument("--mix-alpha", type=float, default=1.0, help="mixing weight lambda ~ Beta(alpha, alpha)")
     p.add_argument("--mix-prob", type=float, default=1.0, help="probability that a batch is mixed")
+    p.add_argument("--teacher", type=Path, help="best.pt of a trained teacher run to distill from")
+    p.add_argument("--kd-alpha", type=float, default=0.9,
+                   help="weight of the distillation loss; the label loss gets 1 - alpha")
+    p.add_argument("--kd-temp", type=float, default=4.0, help="distillation softmax temperature")
+    p.add_argument("--teacher-over-limit", action="store_true",
+                   help="allow more than 5M params; only for training a distillation teacher, never for submission")
     p.add_argument("--val-frac", type=float, default=0.1, help="0 = no val split; the last epoch is kept")
     p.add_argument("--test-frac", type=float, default=0.1)
     p.add_argument("--seed", type=int, default=0, help="seeds both the split and training")
@@ -276,6 +370,7 @@ def main():
     if args.smoke:
         args.epochs = 1
     has_val = args.val_frac > 0
+    saved_args = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}  # for best.pt and summary.json
 
     t0 = time.time()
     x_all, y_all, x_kaggle, kaggle_ids = load_images(args.data, args.data / "cache.npz")
@@ -301,9 +396,35 @@ def main():
     depth = 2 * sum(args.blocks) + 2
     print(f"model: ResNet-{depth}, {args.kernel}x{args.kernel} convs, blocks {args.blocks}, "
           f"width {args.width}, {n_params:,} params, device {dev}")
-    if n_params > PARAM_LIMIT:
+    if n_params > PARAM_LIMIT and not args.teacher_over_limit:
         raise SystemExit(f"{n_params:,} parameters exceeds the competition limit of {PARAM_LIMIT:,}")
+    if n_params > PARAM_LIMIT:
+        print(f"TEACHER RUN: {n_params:,} params, over the {PARAM_LIMIT:,} limit; do not submit its predictions")
     criterion = lambda logits, y: F.cross_entropy(logits, y, label_smoothing=args.label_smoothing)
+
+    teacher = None
+    if args.teacher:
+        # summary.json is written only when a run finishes, so this refuses a teacher that is still training
+        t_summary = args.teacher.parent / "summary.json"
+        if not t_summary.exists():
+            raise SystemExit(f"{t_summary} not found: the teacher run has not finished")
+        with torch.random.fork_rng(devices=[]):  # building the teacher must not shift the training RNG stream
+            teacher, t_ckpt = load_run(args.teacher, dev)
+        if t_ckpt["epoch"] != json.loads(t_summary.read_text())["best_epoch"]:
+            raise SystemExit(f"{args.teacher} is not the final best checkpoint in {t_summary}")
+        for q in teacher.parameters():
+            q.requires_grad_(False)
+        # the student's batches are normalized with the student's stats; re-normalize for the teacher
+        t_mean, t_std = t_ckpt["mean"].to(dev), t_ckpt["std"].to(dev)
+        to_teacher = lambda x: (x * std + mean - t_mean) / t_std
+        ta = t_ckpt["args"]
+        if has_val and (ta["val_frac"], ta["test_frac"], ta["seed"]) != (args.val_frac, args.test_frac, args.seed):
+            print("WARNING: the teacher used a different split, so it may have trained on this run's val / test "
+                  "images and the local scores will be optimistic")
+        _, t_val_acc = evaluate(teacher, to_teacher(x_val), y_val, 1000, amp)
+        print(f"teacher: {args.teacher}, ResNet-{2 * sum(ta['blocks']) + 2} width {ta['width']}, "
+              f"{sum(q.numel() for q in teacher.parameters()):,} params, val acc {t_val_acc:.4f}; "
+              f"kd alpha {args.kd_alpha}, temp {args.kd_temp}")
 
     decay = [q for q in model.parameters() if q.ndim > 1]
     no_decay = [q for q in model.parameters() if q.ndim <= 1]
@@ -324,10 +445,12 @@ def main():
         correct = torch.zeros((), device=dev)
         for i in range(0, len(perm), args.batch):
             idx = perm[i:i + args.batch]
-            # jitter + sharpness on [0, 1] pixels -> normalize -> flip + crop -> Cutout -> Mixup / CutMix
+            # jitter + sharpness + RandAugment on [0, 1] pixels -> normalize -> flip + crop -> Cutout -> Mixup / CutMix
             xb = color_jitter(x_train[idx], *args.jitter)
             if args.sharpness:
                 xb = sharpen(xb, args.sharpness, args.sharpness_prob)
+            if args.randaugment[0]:
+                xb = rand_augment(xb, *args.randaugment)
             xb = augment(norm(xb))
             if args.cutout:
                 xb = cutout(xb, args.cutout)
@@ -339,6 +462,10 @@ def main():
             with torch.autocast(dev.type, dtype=torch.bfloat16, enabled=amp):
                 logits = model(xb).float()
             loss = criterion(logits, ya) if lam == 1.0 else lam * criterion(logits, ya) + (1 - lam) * criterion(logits, yb)
+            if teacher is not None:
+                with torch.no_grad(), torch.autocast(dev.type, dtype=torch.bfloat16, enabled=amp):
+                    t_logits = teacher(to_teacher(xb)).float()
+                loss = (1 - args.kd_alpha) * loss + args.kd_alpha * kd_loss(logits, t_logits, args.kd_temp)
             opt.zero_grad(set_to_none=True)
             loss.backward()
             opt.step()
@@ -352,8 +479,7 @@ def main():
         history.append(h)
         if not has_val or val_acc > best_acc:  # without val, every epoch overwrites best.pt
             best_acc, best_epoch = val_acc, epoch
-            torch.save({"model": model.state_dict(), "epoch": epoch, "args": vars(args) | {"data": str(args.data),
-                        "out": str(args.out)}, "mean": mean.cpu(), "std": std.cpu()}, args.out / "best.pt")
+            torch.save({"model": model.state_dict(), "epoch": epoch, "args": saved_args, "mean": mean.cpu(), "std": std.cpu()}, args.out / "best.pt")
         print(f"epoch {epoch:3d}  train {h['train_loss']:.4f} / {h['train_acc']:.4f}  "
               f"val {val_loss:.4f} / {val_acc:.4f}  lr {h['lr']:.4f}  {h['seconds']:.1f}s", flush=True)
         if has_val and args.patience and epoch - best_epoch >= args.patience:
@@ -377,9 +503,10 @@ def main():
                "test_loss": nan_to_none(test_loss), "test_acc": nan_to_none(test_acc),
                "test_acc_tta": nan_to_none(test_acc_tta), "train_seconds": train_seconds,
                "split": {"train": len(tr), "val": len(va), "test": len(te)},
+               "teacher_val_acc": nan_to_none(t_val_acc) if teacher is not None else None,
                "kaggle_pred_counts": np.bincount(preds, minlength=10).tolist(),
                "kaggle_tta_changed": int((preds != preds_tta).sum()),
-               "args": vars(args) | {"data": str(args.data), "out": str(args.out)}}
+               "args": saved_args}
     (args.out / "history.json").write_text(json.dumps(history, indent=1))
     (args.out / "summary.json").write_text(json.dumps(summary, indent=1))
     plot(history, args.out / "curves.png")
