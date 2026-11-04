@@ -23,6 +23,7 @@ data/
 *.pickle
 # Smoke-test and scratch runs
 runs/smoke/
+runs/smoke_pipeline/
 runs/tmp*/
 runs/debug*/
 runs/scratch*/
