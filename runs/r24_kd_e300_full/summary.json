@@ -1,0 +1,73 @@
+{
+ "depth": 24,
+ "params": 4697162,
+ "best_epoch": 300,
+ "best_val_acc": null,
+ "epochs_run": 300,
+ "stopped_early": false,
+ "test_loss": null,
+ "test_acc": null,
+ "test_acc_tta": null,
+ "train_seconds": 2439.8539407253265,
+ "split": {
+  "train": 50000,
+  "val": 0,
+  "test": 0
+ },
+ "teacher_val_acc": null,
+ "kaggle_pred_counts": [
+  182,
+  218,
+  213,
+  205,
+  191,
+  209,
+  183,
+  203,
+  202,
+  194
+ ],
+ "kaggle_tta_changed": 44,
+ "args": {
+  "data": "/scratch/rl3725/deep_learning/project_1/data",
+  "out": "/scratch/rl3725/deep_learning/project_1/runs/r24_kd_e300_full",
+  "blocks": [
+   4,
+   4,
+   3
+  ],
+  "width": 64,
+  "kernel": 3,
+  "epochs": 300,
+  "patience": 0,
+  "batch": 128,
+  "lr": 0.1,
+  "wd": 0.0005,
+  "warmup": 1.0,
+  "jitter": [
+   0.2,
+   0.2,
+   0.2
+  ],
+  "sharpness": 0.0,
+  "sharpness_prob": 0.5,
+  "randaugment": [
+   1,
+   9
+  ],
+  "label_smoothing": 0.1,
+  "cutout": 16,
+  "mix": "cutmix",
+  "mix_alpha": 1.0,
+  "mix_prob": 1.0,
+  "teacher": "/scratch/rl3725/deep_learning/project_1/runs/teacher_w128_full/best.pt",
+  "kd_alpha": 0.9,
+  "kd_temp": 4.0,
+  "teacher_over_limit": false,
+  "val_frac": 0.0,
+  "test_frac": 0.0,
+  "seed": 0,
+  "device": "cuda",
+  "smoke": false
+ }
+}

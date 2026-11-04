@@ -8,7 +8,7 @@
  "test_loss": null,
  "test_acc": null,
  "test_acc_tta": null,
- "train_seconds": 2222.3054711818695,
+ "train_seconds": 2268.495354413986,
  "split": {
   "train": 50000,
   "val": 0,
@@ -16,21 +16,21 @@
  },
  "teacher_val_acc": null,
  "kaggle_pred_counts": [
-  174,
-  219,
-  206,
-  218,
-  196,
-  193,
-  184,
+  175,
+  216,
+  216,
   201,
-  208,
-  201
+  193,
+  212,
+  187,
+  196,
+  209,
+  195
  ],
- "kaggle_tta_changed": 46,
+ "kaggle_tta_changed": 43,
  "args": {
-  "data": "/scratch/tjv235/deep_learning/kaggle_resnet_cifar10/data",
-  "out": "kaggle_resnet_cifar10/runs/teacher_w128_full",
+  "data": "/scratch/rl3725/deep_learning/project_1/data",
+  "out": "/scratch/rl3725/deep_learning/project_1/runs/teacher_w128_full",
   "blocks": [
    4,
    4,
