@@ -97,6 +97,7 @@ Blocks per stage (`--blocks`), base width (`--width`) and kernel size (`--kernel
 | Augmentation (GPU) | color jitter (brightness/contrast/saturation ±0.2), random horizontal flip, 4-px zero-pad random crop |
 | RandAugment | 1 op at magnitude 9 for the student, 2 ops for the teachers (`--randaugment 1 9` / `2 9`) |
 | Random grayscale | 5% of the student's training images (`--grayscale 0.05`): the Kaggle images are grayscale 3× as often as the training set |
+| Random zoom (optional) | off in the submitted model; `--zoom LO HI` rescales each image by a factor drawn from U(LO, HI) after the crop (tried as `--zoom 0.7 1.4` in round 5, see [Results](#results)) |
 | Distillation | three teachers, same architecture at width 128 (18,765,962 params, `--teacher-over-limit`), same data split, training seeds 0/1/2; the student matches their averaged logits with the Hinton KL loss at temperature 4, weight 0.9 (`--kd-alpha 0.9 --kd-temp 4`) |
 | Test-time augmentation | predictions averaged over the image and its mirror (`submission_tta.csv`) |
 | Cutout | one random 16×16 square per image zeroed after normalization (`--cutout 16`) |
@@ -106,7 +107,7 @@ Blocks per stage (`--blocks`), base width (`--width`) and kernel size (`--kernel
 | Precision | bfloat16 autocast + channels-last on CUDA; float32 on Apple GPUs (MPS) and CPU |
 
 All augmentation runs on the GPU inside the training loop, per batch, in this order: color jitter on
-[0, 1] pixels → normalize → flip + crop → Cutout → CutMix. The loss is
+[0, 1] pixels → normalize → flip + crop → zoom (only with `--zoom`) → Cutout → CutMix. The loss is
 `λ · CE(y_a) + (1 − λ) · CE(y_b)` with label smoothing inside each term. Because the training targets
 are soft and mixed, the training loss and accuracy in `history.json` are not directly comparable to
 the val numbers. `--mix mixup` swaps CutMix for Mixup, and `--mix-alpha` / `--mix-prob` control the
@@ -140,12 +141,23 @@ local score by construction, so the held-out student is their paired estimate.
 
 | Run | Params | Val | Local test | + flip TTA | Kaggle |
 |---|---|---|---|---|---|
-| Teacher w128, training seed 0 (`runs/teacher_w128`) | 18.8M | 97.00% | 97.38% | 97.48% | never submitted |
+| Teacher w128, training seed 0 (`runs/teacher_w128`) | 18.8M | 97.22% | 97.12% | 97.38% | never submitted |
 | Teacher w128, training seed 1 | 18.8M | 97.50% | 97.26% | 97.60% | never submitted |
 | Teacher w128, training seed 2 | 18.8M | 97.02% | 97.42% | 97.66% | never submitted |
 | Teacher ensemble, averaged logits | | 97.56% | | | never submitted |
 | **Student `r24_kd_t3_e300`**, 300 epochs, 27 min | **4,697,162** | 97.24% | **97.42%** | **97.64%** | |
 | **Student `r24_kd_t3_e300_full`**, all 50k, 34 min | **4,697,162** | n/a | n/a | n/a | **0.907** (`submission_tta.csv`) |
+| Student `r24_kd_t3_e800`, 800 epochs, 73 min | 4,697,162 | 97.54% | 97.64% | 97.82% | |
+| Student `r24_kd_t3_e800_full`, all 50k, 94 min | 4,697,162 | n/a | n/a | n/a | 0.899 |
+| Student `r24_kd_t3_e300_zoom`, + `--zoom 0.7 1.4`, 28 min | 4,697,162 | 96.92% | 97.22% | 97.30% | |
+| Student `r24_kd_t3_e300_zoom_full`, all 50k, 35 min | 4,697,162 | n/a | n/a | n/a | 0.904 |
+| Student `r24_kd_t3_e300_b453`, `--blocks 4 5 3`, 28 min | 4,992,586 | 97.42% | 97.32% | 97.42% | |
+| Student `r24_kd_t3_e300_b453_full`, all 50k, 35 min | 4,992,586 | n/a | n/a | n/a | 0.903 |
+
+The seed-0 teacher in `runs/teacher_w128` is the training the round-3 and round-4 students distilled
+from (its val accuracy is the first entry of `teacher_val_accs` in their `summary.json`). The round-2
+single-teacher student `runs/r24_kd` used an earlier training of the same configuration (val 97.00%,
+test 97.38%), kept in git history (commit 60d4aac).
 
 How the rounds compare, same split and seed:
 
@@ -154,8 +166,11 @@ How the rounds compare, same split and seed:
 | 1 | 5×5 ResNet-20, 2,986,666 params, 100 epochs, jitter / flip / crop only | 92.74% | 0.82 |
 | 2 | 3×3 ResNet-24, 4,697,162 params, + label smoothing, Cutout, CutMix, 200 epochs | 96.50% | 0.88 |
 | 3 | + RandAugment, distilled from one w128 teacher, 200 epochs; submission trained on all 50k | 97.24% | 0.897 |
+| 3b | the same single-teacher student for 300 epochs (`runs/r24_kd_e300*`) | 97.32% / 97.48% TTA | — |
 | 4 | + three-teacher ensemble, random grayscale, 300 epochs; all 50k; flip TTA | 97.42% / 97.64% TTA | **0.907** |
-| 4b | the same with 800 student epochs (`EPOCHS=800`, not in `runs/`) | 97.64% / 97.82% TTA | 0.899 |
+| 4b | the same with 800 student epochs (`EPOCHS=800`, `runs/r24_kd_t3_e800*`) | 97.64% / 97.82% TTA | 0.899 |
+| 5a | round 4 + random zoom 0.7–1.4× for the student (`--zoom 0.7 1.4`) | 97.22% / 97.30% TTA | 0.904 |
+| 5b | round 4 with one more block in stage 2 (`--blocks 4 5 3`, 4,992,586 params) | 97.32% / 97.42% TTA | 0.903 |
 
 The student with flip TTA is level with the ensemble it was distilled from (97.64% vs 97.56%), so the
 teachers are now the ceiling. A longer schedule was the first thing tried (distillation keeps improving
@@ -163,6 +178,12 @@ with very long schedules, Beyer et al. 2022): the 800-epoch student is the best 
 number, val 97.54%, test 97.64% and 97.82% with flip TTA, yet scored 0.899 on Kaggle. That is a
 16-image swing on the hidden set, inside its noise (next paragraph), so the two students are
 indistinguishable there and the 300-epoch run stays the submitted one.
+
+Round 5 changed one thing at a time from the round-4 recipe (see [Fifth round](#fifth-round-one-change-at-a-time)):
+random zoom, the augmentation suggested by the shift analysis below, and the only deeper block layout
+that still fits under 5M parameters. Each moved about 90 of the 2,000 Kaggle predictions and scored
+0.904 and 0.903, again inside the noise of the 0.907 entry. More parameters and scale augmentation
+do not close the gap either, so the round-4 student remains the selected submission.
 
 Two caveats when reading the Kaggle column. The hidden set has 2,000 images, so its standard error at
 90% is about 0.7 points: the steps above are real, but anything smaller is leaderboard noise, and the
@@ -261,6 +282,32 @@ The ensemble-then-student pipeline is `train_pipeline.ipynb` for Jupyter and `pi
 Slurm; both skip any stage that already has a `summary.json`, so a crashed job resumes. Each round's
 Kaggle score is in the table under [Results](#results).
 
+### Fifth round: one change at a time
+
+With the round-4 student level with its teachers locally, the remaining 7-point gap is the shift to
+the Kaggle images, so round 5 started from a failure analysis instead of a new recipe. A linear
+classifier trained to tell Kaggle images from training images reaches an AUC of 0.74 on the student's
+penultimate-layer features but only 0.58 on pixel statistics (per-channel mean and std, brightness,
+saturation, sharpness; every effect size below 0.25), so the shift is in content and framing rather than
+in colour or preprocessing. The student's confidence drops on the most shifted images (correlation −0.73
+with the shift score), and it is scale-brittle on them: zooming a Kaggle image out by 1.25× flips 8.6% of
+its predictions, against 0.55% on training images.
+
+Two variants were trained from the same teachers, each differing from round 4 in exactly one flag, and
+submitted after their held-out twins came out within noise of the 0.907 model:
+
+1. **Random zoom** (`--zoom 0.7 1.4`), the augmentation the analysis points at: each image is rescaled by
+   a random factor after the crop, zooming in by cropping the border or out by zero-filling it. Held-out
+   97.22% / 97.30% TTA, Kaggle 0.904.
+2. **One more block** (`--blocks 4 5 3`, 4,992,586 parameters), the only deeper or wider layout that still
+   fits under the cap (`--blocks 4 5 3` is 4,992,586, `5 5 3` is 5,066,570 and width 66 is 4,994,956;
+   anything wider is over). Held-out 97.32% / 97.42% TTA, Kaggle 0.903.
+
+Both are ties with the round-4 student on every number, so that is where the 4.70M-parameter choice
+comes from: the last 6% of the budget buys nothing measurable, and the submitted model keeps the
+smaller layout. The pipeline accepts such variants as `SUFFIX` / `STUDENT_EXTRA` environment variables
+(see [NYU HPC](#nyu-hpc)); the teachers are reused, so a variant costs about one GPU hour.
+
 ## Usage
 
 ```bash
@@ -274,6 +321,7 @@ python train.py --smoke --out runs/smoke
 # variants: every hyperparameter is a flag, see `python train.py -h`
 python train.py --blocks 2 2 2 --width 16
 python train.py --mix mixup --mix-alpha 0.4 --cutout 0          # Mixup instead of CutMix, no Cutout
+python train.py --zoom 0.7 1.4                                   # random zoom per image (round-5 variant)
 
 # model card for any config (before training) or any finished run
 python model_summary.py --blocks 4 4 3 --width 64 --kernel 3
@@ -345,13 +393,16 @@ skips any stage whose run directory already has a `summary.json`, so after a cra
 just submit it again and it resumes at the first unfinished stage:
 
 ```bash
-sbatch project_1/pipeline.sbatch                                       # the real thing, 7 h limit
+sbatch project_1/pipeline.sbatch                                       # the real thing, 4 h limit
 SMOKE=1 sbatch --export=ALL --time=00:20:00 project_1/pipeline.sbatch   # 1-epoch plumbing check
+# a student variant once the teachers exist: adds a suffix to the two student run names
+SUFFIX=zoom STUDENT_EXTRA="--zoom 0.7 1.4" sbatch --export=ALL project_1/pipeline.sbatch
+SUFFIX=b453 STUDENT_EXTRA="--blocks 4 5 3" sbatch --export=ALL project_1/pipeline.sbatch
 ```
 
-The job file's default time limit is 3 hours, enough for every stage of the teacher-ensemble pipeline
-in `train_pipeline.ipynb` (a w128 teacher takes about 37 minutes on all 50k; the 3-teacher, 300-epoch
-distilled student about 95). Override with `sbatch --time=HH:MM:SS` for longer runs. It uses the course allocation (`--account`, `--partition`); check yours with
+`pipeline.sbatch` has a 4-hour limit, enough for the whole teacher-ensemble pipeline on an H100 (a w128
+teacher takes 17 to 31 minutes on the held-out split and 20 to 38 on all 50k; the 300-epoch student 27
+and 34). `train.sbatch` has a 3-hour limit for a single run. Override either with `sbatch --time=HH:MM:SS`. `train.sbatch` uses the course allocation (`--account`, `--partition`); check yours with
 `sacctmgr show assoc user=$USER format=account%40,partition%20` and pass different ones on the
 `sbatch` command line if needed. `ROOT`, `REPO`, `OVERLAY`, `SIF`, `ENV_SH`, `OUT` and `ARGS` environment
 variables override the project directory, repo folder name, container, activation script, run
