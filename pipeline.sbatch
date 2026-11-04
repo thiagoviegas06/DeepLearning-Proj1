@@ -24,6 +24,7 @@
 # first unfinished stage. Resubmit after any edit to EPOCHS/N_TEACHERS: the run names carry them.
 #
 #   mkdir -p slurm_logs && sbatch project_1/pipeline.sbatch
+#   SUFFIX=zoom STUDENT_EXTRA="--zoom 0.7 1.4" sbatch --export=ALL project_1/pipeline.sbatch   # student variant -> runs/r24_kd_t3_e300_zoom*
 #   SMOKE=1 sbatch --export=ALL --time=00:20:00 project_1/pipeline.sbatch   # 1 epoch, 1k images, runs/smoke_pipeline/
 #
 # Same environment plumbing as train.sbatch: overlay + /ext3/env.sh, or PY=/path/to/python to skip the
@@ -44,7 +45,9 @@ TEACHER_NAME="${TEACHER_NAME:-teacher_w128}"
 SEED=0                                  # the data split, shared by every run
 GRAYSCALE=0.05                          # student only
 SMOKE="${SMOKE:-}"                      # non-empty: --smoke on every stage, into runs/smoke_pipeline/
-TAG="t${N_TEACHERS}_e${EPOCHS}"
+SUFFIX="${SUFFIX:-}"                    # run-name suffix for a student variant (the teachers are reused as they are)
+STUDENT_EXTRA="${STUDENT_EXTRA:-}"      # extra student flags, e.g. "--zoom 0.7 1.4" or "--blocks 4 5 3" (a repeated flag overrides BASE: last one wins)
+TAG="t${N_TEACHERS}_e${EPOCHS}${SUFFIX:+_$SUFFIX}"
 
 BASE="--blocks 4 4 3 --kernel 3 --patience 0 --batch 128 --lr 0.1 --wd 5e-4 --warmup 1.0 \
 --jitter 0.2 0.2 0.2 --label-smoothing 0.1 --cutout 16 --mix cutmix --seed $SEED"
@@ -101,11 +104,11 @@ seed_flag() { [[ "$1" -gt 0 ]] && echo "--train-seed $1"; return 0; }
     for ((k = 0; k < N_TEACHERS; k++)); do
         run_stage "${teachers[$k]}"      $BASE $TEACHER $(seed_flag "$k")
     done
-    run_stage "r24_kd_$TAG"              $BASE $STUDENT --teacher $teacher_pts
+    run_stage "r24_kd_$TAG"              $BASE $STUDENT $STUDENT_EXTRA --teacher $teacher_pts
     for ((k = 0; k < N_TEACHERS; k++)); do
         run_stage "${teachers_full[$k]}" $BASE $TEACHER $FULL $(seed_flag "$k")
     done
-    run_stage "r24_kd_${TAG}_full"       $BASE $STUDENT $FULL --teacher $teacher_full_pts
+    run_stage "r24_kd_${TAG}_full"       $BASE $STUDENT $STUDENT_EXTRA $FULL --teacher $teacher_full_pts
 }
 echo "done $(date)   upload: $RUNS/r24_kd_${TAG}_full/submission_tta.csv (or submission.csv without flip TTA)"
 

@@ -6,7 +6,7 @@ unlabeled Kaggle test images. The labeled set is split per class into train / va
 40,000 / 5,000 / 5,000). Val picks the best epoch; the local test split is scored once at the end.
 With --val-frac 0 --test-frac 0 the model trains on all 50,000 and the last epoch is kept.
 The PNGs are decoded once into data/cache.npz, and the whole dataset lives on the device. All
-augmentation (color jitter, random grayscale, sharpness, RandAugment, flip, pad-and-crop, Cutout,
+augmentation (color jitter, random grayscale, sharpness, RandAugment, flip, pad-and-crop, zoom, Cutout,
 Mixup / CutMix) runs on the GPU per batch. The local test split and the Kaggle images are scored both plain and with flip TTA.
 
 Knowledge distillation: train a larger teacher first (it may exceed the 5M limit with
@@ -236,6 +236,19 @@ def augment(x, pad=4):
              rows[:, None, :, None], cols[:, None, None, :]]
 
 
+def zoom(x, lo, hi):
+    """Random scale per image, factor ~ U(lo, hi): > 1 enlarges the object (the border is cropped away),
+    < 1 shrinks it and zero-fills the margin (zero = channel mean after normalization). Bilinear
+    resampling about the image center through an affine grid. Motivated by the Kaggle images, whose
+    objects are framed at more varied scales than CIFAR's (close-ups, small objects in a wide scene)."""
+    n = x.shape[0]
+    s = lo + (hi - lo) * torch.rand(n, device=x.device)
+    theta = torch.zeros(n, 2, 3, device=x.device, dtype=x.dtype)
+    theta[:, 0, 0] = theta[:, 1, 1] = 1 / s
+    grid = F.affine_grid(theta, list(x.shape), align_corners=False)
+    return F.grid_sample(x, grid, mode="bilinear", padding_mode="zeros", align_corners=False)
+
+
 def cutout(x, size):
     """Cutout (DeVries & Taylor, 2017): zero one size x size square per image, centered at a uniform
     random pixel so it may be clipped by the border. Applied after normalization, so zero is the
@@ -363,6 +376,8 @@ def main():
     p.add_argument("--sharpness-prob", type=float, default=0.5, help="probability that an image is sharpened")
     p.add_argument("--randaugment", type=int, nargs=2, default=[0, 0], metavar=("N", "M"),
                    help="RandAugment: N ops per image at magnitude M of 30 (e.g. 2 9; 0 0 = off)")
+    p.add_argument("--zoom", type=float, nargs=2, default=[1.0, 1.0], metavar=("LO", "HI"),
+                   help="random scale factor per training image, uniform in [LO, HI] (e.g. 0.7 1.4; 1 1 = off)")
     p.add_argument("--label-smoothing", type=float, default=0.0, help="cross-entropy label smoothing (0 = off)")
     p.add_argument("--cutout", type=int, default=0,
                    help="side of the square hole Cutout zeroes in each training image (0 = off; 16 is standard for CIFAR)")
@@ -490,6 +505,8 @@ def main():
             if args.randaugment[0]:
                 xb = rand_augment(xb, *args.randaugment)
             xb = augment(norm(xb))
+            if args.zoom != [1.0, 1.0]:
+                xb = zoom(xb, *args.zoom)
             if args.cutout:
                 xb = cutout(xb, args.cutout)
             ya = yb = y_train[idx]
