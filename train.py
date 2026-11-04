@@ -6,19 +6,23 @@ unlabeled Kaggle test images. The labeled set is split per class into train / va
 40,000 / 5,000 / 5,000). Val picks the best epoch; the local test split is scored once at the end.
 With --val-frac 0 --test-frac 0 the model trains on all 50,000 and the last epoch is kept.
 The PNGs are decoded once into data/cache.npz, and the whole dataset lives on the device. All
-augmentation (color jitter, sharpness, RandAugment, flip, pad-and-crop, Cutout, Mixup / CutMix) runs
-on the GPU per batch. The local test split and the Kaggle images are scored both plain and with flip TTA.
+augmentation (color jitter, random grayscale, sharpness, RandAugment, flip, pad-and-crop, Cutout,
+Mixup / CutMix) runs on the GPU per batch. The local test split and the Kaggle images are scored both plain and with flip TTA.
 
 Knowledge distillation: train a larger teacher first (it may exceed the 5M limit with
 --teacher-over-limit; it is never submitted), then train the student with --teacher TEACHER_RUN/best.pt.
-The teacher sees the same augmented batches and the student matches its softened predictions.
+The teacher sees the same augmented batches and the student matches its softened predictions. Several
+teachers (--teacher A/best.pt B/best.pt ...) act as an ensemble: the student matches their averaged
+logits. Teachers that should differ only in their weights share the student's --seed (the data split)
+and get their own --train-seed.
 
   python train.py                                   # 5x5 ResNet-20 baseline, 100 epochs, early stopping
   python train.py --smoke                           # CPU check, tiny subset
   python train.py --blocks 4 4 3 --width 64 --kernel 3 --epochs 200 --patience 0 \
                   --label-smoothing 0.1 --cutout 16 --mix cutmix     # 4.7M-param recipe
   python train.py ... --width 128 --teacher-over-limit --out runs/teacher   # 18.8M-param teacher
-  python train.py ... --width 64 --teacher runs/teacher/best.pt             # distilled student
+  python train.py ... --width 128 --teacher-over-limit --train-seed 1 --out runs/teacher_s1   # 2nd teacher, same split
+  python train.py ... --width 64 --teacher runs/teacher/best.pt runs/teacher_s1/best.pt      # student of the ensemble
 
 Writes OUT/history.json, summary.json, curves.png, best.pt, submission.csv and submission_tta.csv (id,label).
 Run `python model_summary.py --run OUT` afterwards for the layer table, parameter count and test accuracy.
@@ -133,6 +137,14 @@ def color_jitter(x, brightness, contrast, saturation):
         g = gray(x)
         x = (x - g) * factor(saturation) + g
     return x.clamp(0, 1)
+
+
+def random_grayscale(x, prob):
+    """Like torchvision's RandomGrayscale on [0, 1] pixels: with probability `prob` per image, replace the
+    three channels by their luminance."""
+    g = (x * torch.tensor([0.299, 0.587, 0.114], device=x.device)[:, None, None]).sum(1, keepdim=True)
+    apply = torch.rand(x.shape[0], device=x.device) < prob
+    return torch.where(apply[:, None, None, None], g.expand_as(x), x)
 
 
 def sharpen(x, factor, prob):
@@ -344,6 +356,8 @@ def main():
     p.add_argument("--warmup", type=float, default=1.0, help="linear warmup, in epochs")
     p.add_argument("--jitter", type=float, nargs=3, default=[0.2, 0.2, 0.2], metavar=("B", "C", "S"),
                    help="color jitter strength for brightness, contrast, saturation (0 0 0 = off)")
+    p.add_argument("--grayscale", type=float, default=0.0,
+                   help="probability that a training image is converted to grayscale (0 = off)")
     p.add_argument("--sharpness", type=float, default=0.0,
                    help="sharpness factor for random sharpening, e.g. 2.0 (0 = off)")
     p.add_argument("--sharpness-prob", type=float, default=0.5, help="probability that an image is sharpened")
@@ -355,7 +369,8 @@ def main():
     p.add_argument("--mix", choices=["none", "mixup", "cutmix"], default="none", help="batch mixing augmentation")
     p.add_argument("--mix-alpha", type=float, default=1.0, help="mixing weight lambda ~ Beta(alpha, alpha)")
     p.add_argument("--mix-prob", type=float, default=1.0, help="probability that a batch is mixed")
-    p.add_argument("--teacher", type=Path, help="best.pt of a trained teacher run to distill from")
+    p.add_argument("--teacher", type=Path, nargs="+",
+                   help="best.pt of one or more trained teacher runs to distill from; several are averaged (ensemble)")
     p.add_argument("--kd-alpha", type=float, default=0.9,
                    help="weight of the distillation loss; the label loss gets 1 - alpha")
     p.add_argument("--kd-temp", type=float, default=4.0, help="distillation softmax temperature")
@@ -363,14 +378,20 @@ def main():
                    help="allow more than 5M params; only for training a distillation teacher, never for submission")
     p.add_argument("--val-frac", type=float, default=0.1, help="0 = no val split; the last epoch is kept")
     p.add_argument("--test-frac", type=float, default=0.1)
-    p.add_argument("--seed", type=int, default=0, help="seeds both the split and training")
+    p.add_argument("--seed", type=int, default=0, help="seeds the split and, unless --train-seed is set, training")
+    p.add_argument("--train-seed", type=int, default=None,
+                   help="seed for the weights and the training randomness; defaults to --seed. Use it to train "
+                        "several teachers on the same split")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--smoke", action="store_true", help="1 epoch on 1,000 train images, tiny eval sets")
     args = p.parse_args()
     if args.smoke:
         args.epochs = 1
     has_val = args.val_frac > 0
-    saved_args = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}  # for best.pt and summary.json
+    if args.train_seed is None:
+        args.train_seed = args.seed
+    as_json = lambda v: [str(x) for x in v] if isinstance(v, list) and v and isinstance(v[0], Path) else str(v) if isinstance(v, Path) else v
+    saved_args = {k: as_json(v) for k, v in vars(args).items()}  # for best.pt and summary.json
 
     t0 = time.time()
     x_all, y_all, x_kaggle, kaggle_ids = load_images(args.data, args.data / "cache.npz")
@@ -390,7 +411,7 @@ def main():
     x_val, x_test, x_kag = (norm(to_float(a)) for a in (x_all[va], x_all[te], x_kaggle))
     y_train, y_val, y_test = (torch.from_numpy(y_all[i]).to(dev) for i in (tr, va, te))
 
-    torch.manual_seed(args.seed)
+    torch.manual_seed(args.train_seed)
     model = ResNet(tuple(args.blocks), args.width, args.kernel).to(dev).to(memory_format=torch.channels_last)
     n_params = sum(q.numel() for q in model.parameters())
     depth = 2 * sum(args.blocks) + 2
@@ -402,28 +423,43 @@ def main():
         print(f"TEACHER RUN: {n_params:,} params, over the {PARAM_LIMIT:,} limit; do not submit its predictions")
     criterion = lambda logits, y: F.cross_entropy(logits, y, label_smoothing=args.label_smoothing)
 
-    teacher = None
+    teachers = []  # (model, to_teacher) pairs; the student matches their averaged logits
     if args.teacher:
-        # summary.json is written only when a run finishes, so this refuses a teacher that is still training
-        t_summary = args.teacher.parent / "summary.json"
-        if not t_summary.exists():
-            raise SystemExit(f"{t_summary} not found: the teacher run has not finished")
-        with torch.random.fork_rng(devices=[]):  # building the teacher must not shift the training RNG stream
-            teacher, t_ckpt = load_run(args.teacher, dev)
-        if t_ckpt["epoch"] != json.loads(t_summary.read_text())["best_epoch"]:
-            raise SystemExit(f"{args.teacher} is not the final best checkpoint in {t_summary}")
-        for q in teacher.parameters():
-            q.requires_grad_(False)
-        # the student's batches are normalized with the student's stats; re-normalize for the teacher
-        t_mean, t_std = t_ckpt["mean"].to(dev), t_ckpt["std"].to(dev)
-        to_teacher = lambda x: (x * std + mean - t_mean) / t_std
-        ta = t_ckpt["args"]
-        if has_val and (ta["val_frac"], ta["test_frac"], ta["seed"]) != (args.val_frac, args.test_frac, args.seed):
-            print("WARNING: the teacher used a different split, so it may have trained on this run's val / test "
-                  "images and the local scores will be optimistic")
-        _, t_val_acc = evaluate(teacher, to_teacher(x_val), y_val, 1000, amp)
-        print(f"teacher: {args.teacher}, ResNet-{2 * sum(ta['blocks']) + 2} width {ta['width']}, "
-              f"{sum(q.numel() for q in teacher.parameters()):,} params, val acc {t_val_acc:.4f}; "
+        for path in args.teacher:
+            # summary.json is written only when a run finishes, so this refuses a teacher that is still training
+            t_summary = path.parent / "summary.json"
+            if not t_summary.exists():
+                raise SystemExit(f"{t_summary} not found: the teacher run has not finished")
+            with torch.random.fork_rng(devices=[]):  # building the teacher must not shift the training RNG stream
+                teacher, t_ckpt = load_run(path, dev)
+            if t_ckpt["epoch"] != json.loads(t_summary.read_text())["best_epoch"]:
+                raise SystemExit(f"{path} is not the final best checkpoint in {t_summary}")
+            for q in teacher.parameters():
+                q.requires_grad_(False)
+            # the student's batches are normalized with the student's stats; re-normalize for the teacher
+            t_mean, t_std = t_ckpt["mean"].to(dev), t_ckpt["std"].to(dev)
+            to_teacher = lambda x, m=t_mean, sd=t_std: (x * std + mean - m) / sd
+            ta = t_ckpt["args"]
+            if has_val and (ta["val_frac"], ta["test_frac"], ta["seed"]) != (args.val_frac, args.test_frac, args.seed):
+                print(f"WARNING: teacher {path} used a different split, so it may have trained on this run's val / "
+                      "test images and the local scores will be optimistic")
+            _, acc = evaluate(teacher, to_teacher(x_val), y_val, 1000, amp)
+            print(f"teacher: {path}, ResNet-{2 * sum(ta['blocks']) + 2} width {ta['width']}, "
+                  f"{sum(q.numel() for q in teacher.parameters()):,} params, train seed {ta.get('train_seed', ta['seed'])}, "
+                  f"val acc {acc:.4f}")
+            teachers.append((teacher, to_teacher, acc))
+
+    def teacher_logits(xb):
+        """Average of the teachers' logits on the student's (normalized) batch."""
+        return torch.stack([t(tt(xb)).float() for t, tt, _ in teachers]).mean(0)
+
+    t_val_acc, t_val_accs = float("nan"), [acc for _, _, acc in teachers]
+    if teachers and has_val:
+        with torch.no_grad(), torch.autocast(dev.type, dtype=torch.bfloat16, enabled=amp):
+            ens = torch.cat([teacher_logits(x_val[i:i + 1000]) for i in range(0, len(x_val), 1000)])
+        t_val_acc = (ens.argmax(1) == y_val).float().mean().item()
+    if teachers:
+        print(f"distilling from {len(teachers)} teacher(s), ensemble val acc {t_val_acc:.4f}; "
               f"kd alpha {args.kd_alpha}, temp {args.kd_temp}")
 
     decay = [q for q in model.parameters() if q.ndim > 1]
@@ -445,8 +481,10 @@ def main():
         correct = torch.zeros((), device=dev)
         for i in range(0, len(perm), args.batch):
             idx = perm[i:i + args.batch]
-            # jitter + sharpness + RandAugment on [0, 1] pixels -> normalize -> flip + crop -> Cutout -> Mixup / CutMix
+            # jitter + grayscale + sharpness + RandAugment on [0, 1] pixels -> normalize -> flip + crop -> Cutout -> Mixup / CutMix
             xb = color_jitter(x_train[idx], *args.jitter)
+            if args.grayscale:
+                xb = random_grayscale(xb, args.grayscale)
             if args.sharpness:
                 xb = sharpen(xb, args.sharpness, args.sharpness_prob)
             if args.randaugment[0]:
@@ -462,9 +500,9 @@ def main():
             with torch.autocast(dev.type, dtype=torch.bfloat16, enabled=amp):
                 logits = model(xb).float()
             loss = criterion(logits, ya) if lam == 1.0 else lam * criterion(logits, ya) + (1 - lam) * criterion(logits, yb)
-            if teacher is not None:
+            if teachers:
                 with torch.no_grad(), torch.autocast(dev.type, dtype=torch.bfloat16, enabled=amp):
-                    t_logits = teacher(to_teacher(xb)).float()
+                    t_logits = teacher_logits(xb)
                 loss = (1 - args.kd_alpha) * loss + args.kd_alpha * kd_loss(logits, t_logits, args.kd_temp)
             opt.zero_grad(set_to_none=True)
             loss.backward()
@@ -503,7 +541,8 @@ def main():
                "test_loss": nan_to_none(test_loss), "test_acc": nan_to_none(test_acc),
                "test_acc_tta": nan_to_none(test_acc_tta), "train_seconds": train_seconds,
                "split": {"train": len(tr), "val": len(va), "test": len(te)},
-               "teacher_val_acc": nan_to_none(t_val_acc) if teacher is not None else None,
+               "teacher_val_acc": nan_to_none(t_val_acc) if teachers else None,
+               "teacher_val_accs": [nan_to_none(a) for a in t_val_accs] if teachers else None,
                "kaggle_pred_counts": np.bincount(preds, minlength=10).tolist(),
                "kaggle_tta_changed": int((preds != preds_tta).sum()),
                "args": saved_args}
