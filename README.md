@@ -2,13 +2,15 @@
 
 A CIFAR-style ResNet for a Kaggle CIFAR-10 architecture challenge whose one hard rule is **at most
 5 million trainable parameters**, trained from scratch on the provided data only. The model is a
-**3×3 ResNet-24 with stage widths 64/128/256 (4,697,162 parameters)** trained for 200 epochs with SGD,
-a cosine schedule, label smoothing, Cutout and CutMix. The whole pipeline is one PyTorch script that
-keeps the dataset on the GPU and runs augmentation there too, so a full 200-epoch run takes about
-13 minutes on one A100.
+**3×3 ResNet-24 with stage widths 64/128/256 (4,697,162 parameters)** trained with SGD, a cosine
+schedule, label smoothing, Cutout, CutMix and RandAugment, and distilled from an ensemble of three
+18.8M-parameter teachers of the same shape (the teachers are never submitted). The whole pipeline is
+one PyTorch script that keeps the dataset on the GPU and runs augmentation there too; the student
+trains at about 7 s/epoch on one H100.
 
-**Result:** 96.66% validation accuracy, 96.50% on the local held-out split, and **0.88 on the Kaggle
-hidden test set**. See [Results](#results) and [Recent changes](#recent-changes).
+**Result:** 97.42% on the local held-out split (97.64% with flip TTA), level with the teacher
+ensemble, and **0.907 on the Kaggle hidden test set** from the same recipe retrained on all 50,000
+images. See [Results](#results) and [Recent changes](#recent-changes).
 
 ## Competition rules this code enforces
 
@@ -24,7 +26,9 @@ hidden test set**. See [Results](#results) and [Recent changes](#recent-changes)
 train.py              model, data pipeline, augmentation, training loop, Kaggle submission writer
 model_summary.py      layer table, trainable-parameter count vs the 5M limit, final test accuracy of a run
 train_notebook.ipynb  drives train.py, then plots curves, confusion matrix, per-class accuracy, Kaggle counts
-train.sbatch          SLURM job script (NYU HPC, A100, Singularity container)
+train_pipeline.ipynb  the teacher-ensemble -> distilled-student pipeline, held-out split then all 50k
+train.sbatch          SLURM job script: one train.py run (NYU HPC, A100, Singularity container)
+pipeline.sbatch       SLURM job script: the whole teacher-ensemble -> student pipeline as one job
 runs/<name>/          output of each run: summary.json, history.json, curves.png, submission.csv
 data/                 competition data (not tracked, see below)
 ```
@@ -89,8 +93,12 @@ Blocks per stage (`--blocks`), base width (`--width`) and kernel size (`--kernel
 | Optimizer | SGD, Nesterov momentum 0.9, lr 0.1, batch 128 |
 | Weight decay | 5e-4 on conv/linear weights only (none on BN or biases) |
 | Schedule | 1 epoch of linear warmup, then cosine decay to 0, stepped per batch |
-| Epochs | 200, no early stopping (`--patience 0`), so the full cosine schedule runs |
+| Epochs | 300 for the student, 200 for each teacher, no early stopping (`--patience 0`), so the full cosine schedule runs |
 | Augmentation (GPU) | color jitter (brightness/contrast/saturation ±0.2), random horizontal flip, 4-px zero-pad random crop |
+| RandAugment | 1 op at magnitude 9 for the student, 2 ops for the teachers (`--randaugment 1 9` / `2 9`) |
+| Random grayscale | 5% of the student's training images (`--grayscale 0.05`): the Kaggle images are grayscale 3× as often as the training set |
+| Distillation | three teachers, same architecture at width 128 (18,765,962 params, `--teacher-over-limit`), same data split, training seeds 0/1/2; the student matches their averaged logits with the Hinton KL loss at temperature 4, weight 0.9 (`--kd-alpha 0.9 --kd-temp 4`) |
+| Test-time augmentation | predictions averaged over the image and its mirror (`submission_tta.csv`) |
 | Cutout | one random 16×16 square per image zeroed after normalization (`--cutout 16`) |
 | CutMix | a random box from a shuffled partner image is pasted in and the labels are mixed by area, λ ~ Beta(1, 1), every batch (`--mix cutmix`) |
 | Label smoothing | 0.1 (`--label-smoothing 0.1`) |
@@ -105,34 +113,68 @@ the val numbers. `--mix mixup` swaps CutMix for Mixup, and `--mix-alpha` / `--mi
 Beta parameter and the fraction of mixed batches.
 
 The checkpoint with the best val accuracy is reloaded at the end to score the local test split exactly
-once and to write `submission.csv`.
+once and to write the submission files.
 
-The full recipe:
+The full recipe, as `pipeline.sbatch` and `train_pipeline.ipynb` run it (the teachers exceed the
+5M limit on purpose and are only used as targets; only the 4.70M-parameter student is submitted):
 
 ```bash
-python train.py --blocks 4 4 3 --width 64 --kernel 3 --epochs 200 --patience 0 \
-                --label-smoothing 0.1 --cutout 16 --mix cutmix --out runs/resnet24_cutmix
-python model_summary.py --run runs/resnet24_cutmix     # parameter count, layer table, final test accuracy
+# three teachers: same split (--seed 0), different training seeds
+python train.py --blocks 4 4 3 --width 128 --kernel 3 --epochs 200 --patience 0 --label-smoothing 0.1 \
+                --cutout 16 --mix cutmix --randaugment 2 9 --teacher-over-limit --out runs/teacher_w128
+python train.py ... --train-seed 1 --out runs/teacher_w128_s1     # and --train-seed 2 -> runs/teacher_w128_s2
+# the student, 4,697,162 params, distilled from the ensemble
+python train.py --blocks 4 4 3 --width 64 --kernel 3 --epochs 300 --patience 0 --label-smoothing 0.1 \
+                --cutout 16 --mix cutmix --randaugment 1 9 --grayscale 0.05 --kd-alpha 0.9 --kd-temp 4 \
+                --teacher runs/teacher_w128/best.pt runs/teacher_w128_s1/best.pt runs/teacher_w128_s2/best.pt \
+                --out runs/r24_kd_t3_e300
+python model_summary.py --run runs/r24_kd_t3_e300     # parameter count, layer table, final test accuracy
+# the submission: the same four runs again on all 50,000 images (--val-frac 0 --test-frac 0), last epoch kept
 ```
 
 ## Results
 
-ResNet-24, 4,697,162 parameters, the recipe above, seed 0, one A100 (also the executed run in
-`train_notebook.ipynb`):
+The recipe above, seed 0, one H100 (Slurm job 21775660; `runs/r24_kd_t3_e300_full/slurm_21775660.txt`
+is the log of every stage). Val and local test are the 5,000-image splits; the all-50k runs have no
+local score by construction, so the held-out student is their paired estimate.
 
-| Metric | Value |
-|---|---|
-| Epochs run / best epoch | 200 / 194 |
-| Train accuracy, last epoch (against CutMix + smoothed targets) | 72.6% |
-| Val accuracy (best epoch) | **96.66%** |
-| Local held-out test accuracy (scored once with `best.pt`) | **96.50%** |
-| Kaggle hidden test set | **0.88** |
-| Training time | 766 s (3.8 s / epoch) |
+| Run | Params | Val | Local test | + flip TTA | Kaggle |
+|---|---|---|---|---|---|
+| Teacher w128, training seed 0 (`runs/teacher_w128`) | 18.8M | 97.00% | 97.38% | 97.48% | never submitted |
+| Teacher w128, training seed 1 | 18.8M | 97.50% | 97.26% | 97.60% | never submitted |
+| Teacher w128, training seed 2 | 18.8M | 97.02% | 97.42% | 97.66% | never submitted |
+| Teacher ensemble, averaged logits | | 97.56% | | | never submitted |
+| **Student `r24_kd_t3_e300`**, 300 epochs, 27 min | **4,697,162** | 97.24% | **97.42%** | **97.64%** | |
+| **Student `r24_kd_t3_e300_full`**, all 50k, 34 min | **4,697,162** | n/a | n/a | n/a | **0.907** (`submission_tta.csv`) |
 
-The train accuracy is low by construction: it is measured against mixed, smoothed targets on heavily
-augmented images, not against the clean labels. On the local test split the remaining errors are
-mostly cat ↔ dog confusions, followed by cat/bird/deer. The Kaggle hidden set scores lower than the
-local split, so the local number is an optimistic estimate.
+How the rounds compare, same split and seed:
+
+| Round | Model | Local test | Kaggle |
+|---|---|---|---|
+| 1 | 5×5 ResNet-20, 2,986,666 params, 100 epochs, jitter / flip / crop only | 92.74% | 0.82 |
+| 2 | 3×3 ResNet-24, 4,697,162 params, + label smoothing, Cutout, CutMix, 200 epochs | 96.50% | 0.88 |
+| 3 | + RandAugment, distilled from one w128 teacher, 200 epochs; submission trained on all 50k | 97.24% | 0.897 |
+| 4 | + three-teacher ensemble, random grayscale, 300 epochs; all 50k; flip TTA | 97.42% / 97.64% TTA | **0.907** |
+| 4b | the same with 800 student epochs (`EPOCHS=800`, not in `runs/`) | 97.64% / 97.82% TTA | 0.899 |
+
+The student with flip TTA is level with the ensemble it was distilled from (97.64% vs 97.56%), so the
+teachers are now the ceiling. A longer schedule was the first thing tried (distillation keeps improving
+with very long schedules, Beyer et al. 2022): the 800-epoch student is the best model on every local
+number, val 97.54%, test 97.64% and 97.82% with flip TTA, yet scored 0.899 on Kaggle. That is a
+16-image swing on the hidden set, inside its noise (next paragraph), so the two students are
+indistinguishable there and the 300-epoch run stays the submitted one.
+
+Two caveats when reading the Kaggle column. The hidden set has 2,000 images, so its standard error at
+90% is about 0.7 points: the steps above are real, but anything smaller is leaderboard noise, and the
+score must not be used to pick between seeds. And the 7-point gap to the local split is a source
+shift, not a preprocessing bug: the Kaggle images match the training set in per-channel mean, std,
+brightness and saturation, but visibly come from a different source (web-photo look, 3× the grayscale
+fraction, slightly sharper), much like CIFAR-10.1, whose published accuracy drop is the same size.
+Regularization, distillation and TTA all narrow it; nothing in the preprocessing can.
+
+The train accuracy in `history.json` is low by construction: it is measured against mixed, smoothed
+targets on heavily augmented images, not against the clean labels. On the local test split the
+remaining errors are mostly cat ↔ dog confusions, followed by cat/bird/deer.
 
 ## Recent changes
 
@@ -180,10 +222,49 @@ was added to print the layer table, the trainable-parameter count against the 5M
 final test accuracy, `train.py` now refuses to train a model over the limit, and `train_notebook.ipynb`
 was added to drive the script and inspect a run.
 
+### Third and fourth rounds: distillation, RandAugment, all 50k
+
+The round-2 model was 96.5% locally and 0.88 on Kaggle; the local split was close to saturated, so
+the next steps aimed at the shifted hidden set. Again every item is a `train.py` flag, all off by
+default. Runs with these flags are the `r24_*` and `teacher_*` directories in `runs/`.
+
+1. **RandAugment** (`--randaugment N M`, Cubuk et al. 2020): N random ops per image out of rotate,
+   shear, translate, brightness, contrast, color, sharpness, posterize, solarize, equalize and
+   autocontrast, at magnitude M, implemented on the GPU like the rest of the pipeline. One op at
+   magnitude 9 gave +0.5 points locally on its own (`runs/r24_ra1_9`); two ops suit the bigger teachers.
+
+2. **Knowledge distillation** (`--teacher RUN/best.pt ...`, Hinton et al. 2015). A width-128 copy of the
+   same network (18.8M parameters, allowed only as a teacher with `--teacher-over-limit`, never
+   submitted) is trained first and reaches about 97.4% locally. The 4.70M student then sees the same
+   augmented, mixed batches and matches the teacher's temperature-4 softened predictions through a KL
+   term with weight 0.9, keeping 0.1 of the ordinary smoothed cross-entropy. The student caught up with
+   its single teacher (97.24%), so round 4 trains **three** teachers that differ only in `--train-seed`
+   on the same split and distils from their **averaged logits**: the ensemble is 97.56% on val, and
+   the student with flip TTA now matches it (97.64%).
+
+3. **Random grayscale** for the student (`--grayscale 0.05`), the one measurable difference between
+   the Kaggle images and the training set (3.3% grayscale images vs 1.1%).
+
+4. **Longer student schedule** (`--epochs 300`): with the distillation signal the student keeps
+   improving late in the cosine schedule (best epoch 289 of 300 on the held-out split).
+
+5. **Training on all 50,000 images** for the submission (`--val-frac 0 --test-frac 0`). Every stage is
+   run twice: once on the 40k/5k/5k split, which gives the honest local numbers above, and once on all
+   50k, where `best.pt` is simply the last epoch and the local score is `null`. The two runs differ
+   only in the data split, so the held-out run's accuracy is reported next to the submission.
+
+6. **Test-time augmentation** at scoring time only: `submission_tta.csv` averages the logits of each
+   image and its mirror (+0.2 points locally, 52 of 2,000 Kaggle predictions changed). Both local
+   accuracies land in `summary.json`.
+
+The ensemble-then-student pipeline is `train_pipeline.ipynb` for Jupyter and `pipeline.sbatch` for
+Slurm; both skip any stage that already has a `summary.json`, so a crashed job resumes. Each round's
+Kaggle score is in the table under [Results](#results).
+
 ## Usage
 
 ```bash
-# current recipe, writes runs/resnet24_cutmix/
+# the round-2 recipe (no distillation), writes runs/resnet24_cutmix/; the full pipeline is in Training recipe
 python train.py --blocks 4 4 3 --width 64 --kernel 3 --epochs 200 --patience 0 \
                 --label-smoothing 0.1 --cutout 16 --mix cutmix --out runs/resnet24_cutmix
 
@@ -206,7 +287,7 @@ parameter count and final test accuracy are printed in the executed notebook.
 
 Every run writes these files to `--out`:
 
-- `submission.csv`: Kaggle predictions (`id,label`)
+- `submission.csv`: Kaggle predictions (`id,label`); `submission_tta.csv` the same with flip TTA
 - `summary.json`: config, parameter count, best epoch, val and test accuracy, predicted class counts
 - `history.json`: per-epoch train/val loss and accuracy, learning rate, epoch time
 - `curves.png`: loss and accuracy plots
@@ -217,31 +298,66 @@ Requirements: Python 3.9+ (3.12 on the cluster), PyTorch, NumPy, Pillow, and mat
 
 ### NYU HPC
 
-One-time setup on the cluster. The repo lives as `kaggle_resnet_cifar10/` inside a project
-directory on `/scratch` (home has a low file-count quota, so the venv goes on scratch too):
+One-time setup on the NYU Torch cluster. The repo lives as `project_1/` inside a project directory on `/scratch`
+(home has a low file-count quota). Python and PyTorch go into a Singularity overlay, the standard
+NYU HPC recipe, because conda/pip trees have far too many files for `/scratch` quotas otherwise:
 
 ```bash
 mkdir -p /scratch/$USER/deep_learning && cd /scratch/$USER/deep_learning
-git clone <this repo> kaggle_resnet_cifar10
-python3 -m venv .venv && .venv/bin/pip install torch numpy pillow matplotlib
+git clone <this repo> project_1
 mkdir -p slurm_logs
-# put the competition files in kaggle_resnet_cifar10/data/ (see Data above)
+# put the competition files in project_1/data/ (see Data above)
+
+# blank overlay + Miniforge installer (both provided by NYU HPC)
+cp /share/apps/overlay-fs-ext3/overlay-15GB-500K.ext3.gz . && gunzip overlay-15GB-500K.ext3.gz   # ls /share/apps/overlay-fs-ext3/ for other sizes
+wget https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh
+
+# install into the overlay (read-write, only this once)
+singularity exec --overlay overlay-15GB-500K.ext3:rw \
+    /share/apps/images/cuda12.1.1-cudnn8.9.0-devel-ubuntu22.04.2.sif /bin/bash
+bash Miniforge3-Linux-x86_64.sh -b -p /ext3/miniforge3
+cat > /ext3/env.sh <<'SH'
+#!/bin/bash
+unset -f which
+source /ext3/miniforge3/etc/profile.d/conda.sh
+export PATH=/ext3/miniforge3/bin:$PATH
+SH
+source /ext3/env.sh
+pip install torch numpy pillow matplotlib torchinfo
+python -c "import torch; print(torch.__version__, torch.cuda.is_available())"   # version, False (no GPU on login node)
+exit
 ```
 
-Submit from that directory; it becomes the job's root, and the venv in it is used:
+Submit from `/scratch/$USER/deep_learning`; it becomes the job's root and the overlay is mounted
+read-only, so several jobs can share it:
 
 ```bash
-OUT=kaggle_resnet_cifar10/runs/resnet24_cutmix \
+OUT=project_1/runs/resnet24_cutmix \
 ARGS="--blocks 4 4 3 --width 64 --kernel 3 --epochs 200 --patience 0 --label-smoothing 0.1 --cutout 16 --mix cutmix" \
-sbatch --export=ALL --time=01:30:00 kaggle_resnet_cifar10/train.sbatch
+sbatch --export=ALL project_1/train.sbatch
 ```
 
-The job file's default time limit is 45 minutes, so the 200-epoch run needs the `--time` override
-above. It uses the course allocation (`--account`, `--partition`); pass different ones on the `sbatch`
-command line if needed. `PY`, `OVERLAY`, `SIF`, `OUT` and `ARGS` environment variables override the
-Python used, wrap it in a Singularity container, and set the run directory and flags. Logs land in
-`slurm_logs/`; each run's outputs land in `OUT`. When `OUT` is not set, the job writes to
-`runs/YYYYMMDD_HHMMSS/`, named by the job's start time. The two original 5×5 ResNet-20 runs predate
+To run the whole teacher-ensemble pipeline of `train_pipeline.ipynb` as one job instead (three
+teachers, the distilled student, then the same four on all 50k, stages back to back on one GPU,
+about 2.5 hours on an H100 with 300 student epochs, and only the two student stages, about one
+hour, once the teachers exist), use `pipeline.sbatch`. It mirrors the notebook's configuration and run names, and
+skips any stage whose run directory already has a `summary.json`, so after a crash or time-out you
+just submit it again and it resumes at the first unfinished stage:
+
+```bash
+sbatch project_1/pipeline.sbatch                                       # the real thing, 7 h limit
+SMOKE=1 sbatch --export=ALL --time=00:20:00 project_1/pipeline.sbatch   # 1-epoch plumbing check
+```
+
+The job file's default time limit is 3 hours, enough for every stage of the teacher-ensemble pipeline
+in `train_pipeline.ipynb` (a w128 teacher takes about 37 minutes on all 50k; the 3-teacher, 300-epoch
+distilled student about 95). Override with `sbatch --time=HH:MM:SS` for longer runs. It uses the course allocation (`--account`, `--partition`); check yours with
+`sacctmgr show assoc user=$USER format=account%40,partition%20` and pass different ones on the
+`sbatch` command line if needed. `ROOT`, `REPO`, `OVERLAY`, `SIF`, `ENV_SH`, `OUT` and `ARGS` environment
+variables override the project directory, repo folder name, container, activation script, run
+directory and flags; `PY=/path/to/python` skips the container and runs that interpreter directly.
+Logs land in `slurm_logs/`; each run's outputs land in `OUT`. When `OUT` is not set, the job writes
+to `runs/YYYYMMDD_HHMMSS/`, named by the job's start time. The two original 5×5 ResNet-20 runs predate
 this scheme and have no recorded start time: `runs/20261029_225523/` (Slurm job 21361893, 30 epochs)
 and `runs/20261029_225524/` (job 21368912, 100 epochs) carry the files' creation time on disk, in job
 order, not the real training time.
@@ -258,3 +374,6 @@ external datasets are used. The techniques come from:
 - H. Zhang, M. Cissé, Y. N. Dauphin, D. Lopez-Paz. *mixup: Beyond Empirical Risk Minimization.* ICLR 2018.
 - S. Yun et al. *CutMix: Regularization Strategy to Train Strong Classifiers with Localizable Features.* ICCV 2019.
 - I. Loshchilov, F. Hutter. *SGDR: Stochastic Gradient Descent with Warm Restarts.* ICLR 2017. (cosine schedule)
+- E. D. Cubuk, B. Zoph, J. Shlens, Q. V. Le. *RandAugment: Practical Automated Data Augmentation with a Reduced Search Space.* CVPR Workshops 2020.
+- G. Hinton, O. Vinyals, J. Dean. *Distilling the Knowledge in a Neural Network.* arXiv:1503.02531, 2015. (distillation loss)
+- L. Beyer, X. Zhai, A. Royer, L. Markeeva, R. Anil, A. Kolesnikov. *Knowledge Distillation: A Good Teacher Is Patient and Consistent.* CVPR 2022. (consistent teaching on the same augmented batch, long schedules)
