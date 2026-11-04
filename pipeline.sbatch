@@ -4,7 +4,7 @@
 #SBATCH --gres=gpu:h100:1          # GPU type: h100 (also h200), a100 as fallback; avoid rtx6000. `sinfo -o "%P %G"` lists them
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=16G
-#SBATCH --time=07:00:00
+#SBATCH --time=04:00:00
 #SBATCH --requeue
 #SBATCH --output=/scratch/rl3725/deep_learning/slurm_logs/resnet_pipeline_%j.out
 #SBATCH --error=/scratch/rl3725/deep_learning/slurm_logs/resnet_pipeline_%j.err
