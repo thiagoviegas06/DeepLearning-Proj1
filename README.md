@@ -97,6 +97,7 @@ Blocks per stage (`--blocks`), base width (`--width`) and kernel size (`--kernel
 | Augmentation (GPU) | color jitter (brightness/contrast/saturation ±0.2), random horizontal flip, 4-px zero-pad random crop |
 | RandAugment | 1 op at magnitude 9 for the student, 2 ops for the teachers (`--randaugment 1 9` / `2 9`) |
 | Random grayscale | 5% of the student's training images (`--grayscale 0.05`): the Kaggle images are grayscale 3× as often as the training set |
+| SAM (optional) | off in the submitted model; `--sam 0.05` applies sharpness-aware minimization (Foret et al. 2021): the gradient is taken at the worst weights within radius 0.05 and applied to the original ones |
 | Random zoom (optional) | off in the submitted model; `--zoom LO HI` rescales each image by a factor drawn from U(LO, HI) after the crop (tried as `--zoom 0.7 1.4` in round 5, see [Results](#results)) |
 | Distillation | three teachers, same architecture at width 128 (18,765,962 params, `--teacher-over-limit`), same data split, training seeds 0/1/2; the student matches their averaged logits with the Hinton KL loss at temperature 4, weight 0.9 (`--kd-alpha 0.9 --kd-temp 4`) |
 | Test-time augmentation | predictions averaged over the image and its mirror (`submission_tta.csv`) |
@@ -347,6 +348,7 @@ python train.py --smoke --out runs/smoke
 python train.py --blocks 2 2 2 --width 16
 python train.py --mix mixup --mix-alpha 0.4 --cutout 0          # Mixup instead of CutMix, no Cutout
 python train.py --zoom 0.7 1.4                                   # random zoom per image (round-5 variant)
+python train.py --sam 0.05                                       # sharpness-aware minimization (2x time per epoch)
 
 # model card for any config (before training) or any finished run
 python model_summary.py --blocks 4 4 3 --width 64 --kernel 3
@@ -453,3 +455,4 @@ external datasets are used. The techniques come from:
 - E. D. Cubuk, B. Zoph, J. Shlens, Q. V. Le. *RandAugment: Practical Automated Data Augmentation with a Reduced Search Space.* CVPR Workshops 2020.
 - G. Hinton, O. Vinyals, J. Dean. *Distilling the Knowledge in a Neural Network.* arXiv:1503.02531, 2015. (distillation loss)
 - L. Beyer, X. Zhai, A. Royer, L. Markeeva, R. Anil, A. Kolesnikov. *Knowledge Distillation: A Good Teacher Is Patient and Consistent.* CVPR 2022. (consistent teaching on the same augmented batch, long schedules)
+- P. Foret, A. Kleiner, H. Mobahi, B. Neyshabur. *Sharpness-Aware Minimization for Efficiently Improving Generalization.* ICLR 2021. (`--sam`)

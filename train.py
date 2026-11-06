@@ -16,6 +16,10 @@ teachers (--teacher A/best.pt B/best.pt ...) act as an ensemble: the student mat
 logits. Teachers that should differ only in their weights share the student's --seed (the data split)
 and get their own --train-seed.
 
+Sharpness-aware minimization (--sam RHO, Foret et al. 2021): each step first climbs to the worst
+weights within an L2 ball of radius RHO (one extra forward/backward), and applies the gradient taken
+there to the original weights, which steers training to flat minima. Doubles the time per epoch.
+
   python train.py                                   # 5x5 ResNet-20 baseline, 100 epochs, early stopping
   python train.py --smoke                           # CPU check, tiny subset
   python train.py --blocks 4 4 3 --width 64 --kernel 3 --epochs 200 --patience 0 \
@@ -326,6 +330,37 @@ def load_run(path, dev):
     return model.eval(), ckpt
 
 
+def sam_perturb(params, rho):
+    """Move each parameter to w + rho * g / ||g|| (g = current grads, one global norm) and return the offsets."""
+    grads = [q.grad for q in params if q.grad is not None]
+    scale = rho / (torch.norm(torch.stack([g.norm(2) for g in grads]), 2) + 1e-12)
+    offsets = []
+    with torch.no_grad():
+        for q in params:
+            e = q.grad * scale if q.grad is not None else None
+            if e is not None:
+                q.add_(e)
+            offsets.append(e)
+    return offsets
+
+
+def sam_restore(params, offsets):
+    with torch.no_grad():
+        for q, e in zip(params, offsets):
+            if e is not None:
+                q.sub_(e)
+
+
+def set_bn_momentum(model, value):
+    """Set every BatchNorm's momentum (0 freezes the running stats); returns the previous values."""
+    prev = []
+    for m in model.modules():
+        if isinstance(m, torch.nn.modules.batchnorm._BatchNorm):
+            prev.append((m, m.momentum))
+            m.momentum = value
+    return prev
+
+
 def kd_loss(student_logits, teacher_logits, temp):
     """Hinton et al. (2015) distillation loss: KL(teacher || student) on temperature-softened
     distributions, scaled by temp^2 so its gradients stay comparable to the cross-entropy's."""
@@ -389,6 +424,8 @@ def main():
     p.add_argument("--kd-alpha", type=float, default=0.9,
                    help="weight of the distillation loss; the label loss gets 1 - alpha")
     p.add_argument("--kd-temp", type=float, default=4.0, help="distillation softmax temperature")
+    p.add_argument("--sam", type=float, default=0.0,
+                   help="sharpness-aware minimization with neighbourhood radius RHO (0 = off; 0.05 is the CIFAR value)")
     p.add_argument("--teacher-over-limit", action="store_true",
                    help="allow more than 5M params; only for training a distillation teacher, never for submission")
     p.add_argument("--val-frac", type=float, default=0.1, help="0 = no val split; the last epoch is kept")
@@ -477,6 +514,7 @@ def main():
         print(f"distilling from {len(teachers)} teacher(s), ensemble val acc {t_val_acc:.4f}; "
               f"kd alpha {args.kd_alpha}, temp {args.kd_temp}")
 
+    params = list(model.parameters())
     decay = [q for q in model.parameters() if q.ndim > 1]
     no_decay = [q for q in model.parameters() if q.ndim <= 1]
     opt = torch.optim.SGD([{"params": decay, "weight_decay": args.wd}, {"params": no_decay, "weight_decay": 0.0}],
@@ -514,15 +552,29 @@ def main():
             if args.mix != "none" and torch.rand(()).item() < args.mix_prob:
                 xb, ya, yb, lam = mix_batch(xb, ya, args.mix, args.mix_alpha)
             xb = xb.contiguous(memory_format=torch.channels_last)
-            with torch.autocast(dev.type, dtype=torch.bfloat16, enabled=amp):
-                logits = model(xb).float()
-            loss = criterion(logits, ya) if lam == 1.0 else lam * criterion(logits, ya) + (1 - lam) * criterion(logits, yb)
-            if teachers:
+            if teachers:  # the targets do not depend on the student's weights: computed once per batch
                 with torch.no_grad(), torch.autocast(dev.type, dtype=torch.bfloat16, enabled=amp):
                     t_logits = teacher_logits(xb)
-                loss = (1 - args.kd_alpha) * loss + args.kd_alpha * kd_loss(logits, t_logits, args.kd_temp)
+
+            def forward_loss():
+                with torch.autocast(dev.type, dtype=torch.bfloat16, enabled=amp):
+                    logits = model(xb).float()
+                loss = criterion(logits, ya) if lam == 1.0 else lam * criterion(logits, ya) + (1 - lam) * criterion(logits, yb)
+                if teachers:
+                    loss = (1 - args.kd_alpha) * loss + args.kd_alpha * kd_loss(logits, t_logits, args.kd_temp)
+                return logits, loss
+
+            logits, loss = forward_loss()
             opt.zero_grad(set_to_none=True)
             loss.backward()
+            if args.sam:  # SAM: gradient at the worst nearby weights, applied to the original weights
+                offsets = sam_perturb(params, args.sam)
+                opt.zero_grad(set_to_none=True)
+                prev_momentum = set_bn_momentum(model, 0.0)  # BN running stats come from the first pass only
+                forward_loss()[1].backward()
+                for m, mom in prev_momentum:
+                    m.momentum = mom
+                sam_restore(params, offsets)
             opt.step()
             sched.step()
             loss_sum += loss.detach() * len(idx)
