@@ -19,6 +19,8 @@ and get their own --train-seed.
 Sharpness-aware minimization (--sam RHO, Foret et al. 2021): each step first climbs to the worst
 weights within an L2 ball of radius RHO (one extra forward/backward), and applies the gradient taken
 there to the original weights, which steers training to flat minima. Doubles the time per epoch.
+Weight averaging (--ema DECAY): an exponential moving average of the weights is kept alongside the
+trained model and is what gets validated, checkpointed and submitted.
 
   python train.py                                   # 5x5 ResNet-20 baseline, 100 epochs, early stopping
   python train.py --smoke                           # CPU check, tiny subset
@@ -32,6 +34,7 @@ Writes OUT/history.json, summary.json, curves.png, best.pt, submission.csv and s
 Run `python model_summary.py --run OUT` afterwards for the layer table, parameter count and test accuracy.
 """
 import argparse
+import copy
 import csv
 import json
 import math
@@ -426,6 +429,9 @@ def main():
     p.add_argument("--kd-temp", type=float, default=4.0, help="distillation softmax temperature")
     p.add_argument("--sam", type=float, default=0.0,
                    help="sharpness-aware minimization with neighbourhood radius RHO (0 = off; 0.05 is the CIFAR value)")
+    p.add_argument("--ema", type=float, default=0.0,
+                   help="keep an exponential moving average of the weights with this per-step decay and evaluate / "
+                        "save that model instead (0 = off; 0.9995 spans the last ~6 epochs at 313 steps/epoch)")
     p.add_argument("--teacher-over-limit", action="store_true",
                    help="allow more than 5M params; only for training a distillation teacher, never for submission")
     p.add_argument("--val-frac", type=float, default=0.1, help="0 = no val split; the last epoch is kept")
@@ -524,6 +530,13 @@ def main():
     sched = torch.optim.lr_scheduler.LambdaLR(
         opt, lambda s: (s + 1) / warm if s < warm else 0.5 * (1 + math.cos(math.pi * (s - warm) / max(1, total - warm))))
 
+    ema_model, ema_steps = None, 0
+    if args.ema:
+        ema_model = copy.deepcopy(model).eval()
+        for q in ema_model.parameters():
+            q.requires_grad_(False)
+    eval_model = ema_model if args.ema else model  # the model that is validated, checkpointed and scored
+
     args.out.mkdir(parents=True, exist_ok=True)
     history, best_acc, best_epoch, stopped_early, train_start = [], -1.0, 0, False, time.time()
     for epoch in range(1, args.epochs + 1):
@@ -577,16 +590,25 @@ def main():
                 sam_restore(params, offsets)
             opt.step()
             sched.step()
+            if ema_model is not None:
+                ema_steps += 1
+                d = min(args.ema, (1 + ema_steps) / (10 + ema_steps))  # warm start: short average early on
+                with torch.no_grad():
+                    for k, v in model.state_dict().items():
+                        e = ema_model.state_dict()[k]
+                        e.mul_(d).add_(v, alpha=1 - d) if v.dtype.is_floating_point else e.copy_(v)
             loss_sum += loss.detach() * len(idx)
             pred = logits.argmax(1)  # on a mixed batch, credit each image's two labels by their weights
             correct += lam * (pred == ya).sum() + (1 - lam) * (pred == yb).sum()
-        val_loss, val_acc = evaluate(model, x_val, y_val, 1000, amp)
+        val_loss, val_acc = evaluate(eval_model, x_val, y_val, 1000, amp)
         h = {"epoch": epoch, "train_loss": loss_sum.item() / len(x_train), "train_acc": correct.item() / len(x_train),
              "val_loss": val_loss, "val_acc": val_acc, "lr": opt.param_groups[0]["lr"], "seconds": time.time() - t_ep}
+        if ema_model is not None:  # the raw (non-averaged) model's val accuracy, for comparison
+            h["val_acc_raw"] = evaluate(model, x_val, y_val, 1000, amp)[1]
         history.append(h)
         if not has_val or val_acc > best_acc:  # without val, every epoch overwrites best.pt
             best_acc, best_epoch = val_acc, epoch
-            torch.save({"model": model.state_dict(), "epoch": epoch, "args": saved_args, "mean": mean.cpu(), "std": std.cpu()}, args.out / "best.pt")
+            torch.save({"model": eval_model.state_dict(), "epoch": epoch, "args": saved_args, "mean": mean.cpu(), "std": std.cpu()}, args.out / "best.pt")
         print(f"epoch {epoch:3d}  train {h['train_loss']:.4f} / {h['train_acc']:.4f}  "
               f"val {val_loss:.4f} / {val_acc:.4f}  lr {h['lr']:.4f}  {h['seconds']:.1f}s", flush=True)
         if has_val and args.patience and epoch - best_epoch >= args.patience:

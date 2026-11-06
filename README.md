@@ -98,6 +98,7 @@ Blocks per stage (`--blocks`), base width (`--width`) and kernel size (`--kernel
 | RandAugment | 1 op at magnitude 9 for the student, 2 ops for the teachers (`--randaugment 1 9` / `2 9`) |
 | Random grayscale | 5% of the student's training images (`--grayscale 0.05`): the Kaggle images are grayscale 3× as often as the training set |
 | SAM (optional) | off in the submitted model; `--sam 0.05` applies sharpness-aware minimization (Foret et al. 2021): the gradient is taken at the worst weights within radius 0.05 and applied to the original ones |
+| EMA (optional) | off in the submitted model; `--ema 0.9995` keeps an exponential moving average of the weights (Polyak averaging) and validates, checkpoints and submits that model |
 | Random zoom (optional) | off in the submitted model; `--zoom LO HI` rescales each image by a factor drawn from U(LO, HI) after the crop (tried as `--zoom 0.7 1.4` in round 5, see [Results](#results)) |
 | Distillation | three teachers, same architecture at width 128 (18,765,962 params, `--teacher-over-limit`), same data split, training seeds 0/1/2; the student matches their averaged logits with the Hinton KL loss at temperature 4, weight 0.9 (`--kd-alpha 0.9 --kd-temp 4`) |
 | Test-time augmentation | predictions averaged over the image and its mirror (`submission_tta.csv`) |
@@ -160,6 +161,8 @@ local score by construction, so the held-out student is their paired estimate.
 | Teacher ensemble, width 192, 42,206,410 params each (`runs/teacher_w192*`) | 42.2M | 97.92% | | | never submitted |
 | Student `r24_kd_t3_e300_tw192`, distilled from it | 4,697,162 | 97.42% | 97.54% | 97.50% | |
 | Student `r24_kd_t3_e300_tw192_full`, all 50k | 4,697,162 | n/a | n/a | n/a | 0.904 |
+| Student `r24_kd_t3_e300_sam`, + `--sam 0.05`, 36 min | 4,697,162 | 97.26% | 97.48% | 97.66% | |
+| Student `r24_kd_t3_e300_sam_full`, all 50k | 4,697,162 | n/a | n/a | n/a | 0.901 |
 
 The seed-0 teacher in `runs/teacher_w128` is the training the round-3 and round-4 students distilled
 from (its val accuracy is the first entry of `teacher_val_accs` in their `summary.json`). The round-2
@@ -180,6 +183,7 @@ How the rounds compare, same split and seed:
 | 5b | round 4 with one more block in stage 2 (`--blocks 4 5 3`, 4,992,586 params) | 97.32% / 97.42% TTA | 0.903 |
 | 6a | round 4 with the teachers trained for 300 epochs (ensemble 97.74% val) | 97.46% / 97.58% TTA | 0.898 |
 | 6b | round 4 with width-192 teachers, 42.2M params each (ensemble 97.92% val) | 97.54% / 97.50% TTA | 0.904 |
+| 7 | round 4 with sharpness-aware minimization for the student (`--sam 0.05`) | 97.48% / 97.66% TTA | 0.901 |
 
 The student with flip TTA is level with the ensemble it was distilled from (97.64% vs 97.56%), so the
 teachers are now the ceiling. A longer schedule was the first thing tried (distillation keeps improving
@@ -195,9 +199,12 @@ that still fits under 5M parameters. Each moved about 90 of the 2,000 Kaggle pre
 do not close the gap either. Round 6 attacked the ceiling instead: since the student had caught up
 with its teachers, the teachers were made stronger, by training them 50% longer or by making them 2.2×
 wider. The ensembles did improve, to 97.74% and 97.92% on val, but the students distilled from them
-stayed level with the round-4 student on the test split and scored 0.898 and 0.904. Seven submissions
-of this model family now span 0.897 to 0.907, a spread smaller than the sampling error of the hidden
-set and unrelated to the local numbers, so the round-4 student remains the selected submission.
+stayed level with the round-4 student on the test split and scored 0.898 and 0.904. Round 7 changed the
+optimizer instead, sharpness-aware minimization (Foret et al. 2021), the one remaining method whose
+published gain on CIFAR-10 ResNets exceeds the leaderboard noise: it came out level on every local
+number and scored 0.901. Eight submissions of this model family now span 0.897 to 0.907, a spread
+smaller than the sampling error of the hidden set and unrelated to the local numbers, so the round-4
+student remains the selected submission.
 
 Two caveats when reading the Kaggle column. The hidden set has 2,000 images, so its standard error at
 90% is about 0.7 points: the steps above are real, but anything smaller is leaderboard noise, and the
@@ -334,6 +341,16 @@ on val, but on the test split they are level with the round-4 student (97.46% / 
 student did not follow it, which marks the capacity of the student, not the teachers, as the limit at
 this budget.
 
+### Seventh round: the optimizer
+
+If the student's generalization is the limit, the optimizer is the last lever. Sharpness-aware
+minimization (`--sam 0.05`) takes each gradient at the worst weights within a small ball around the
+current ones and applies it to the current weights, which drives training to flat minima; flat minima
+are the best-documented route to robustness under distribution shift. The SAM student
+(`r24_kd_t3_e300_sam`) is level with the round-4 student locally (97.48% / 97.66% TTA vs 97.42% /
+97.64%) and scored 0.901. `--ema` adds Polyak averaging of the weights on top for the same reason; it
+costs nothing at training time.
+
 ## Usage
 
 ```bash
@@ -349,6 +366,7 @@ python train.py --blocks 2 2 2 --width 16
 python train.py --mix mixup --mix-alpha 0.4 --cutout 0          # Mixup instead of CutMix, no Cutout
 python train.py --zoom 0.7 1.4                                   # random zoom per image (round-5 variant)
 python train.py --sam 0.05                                       # sharpness-aware minimization (2x time per epoch)
+python train.py --ema 0.9995                                     # evaluate / submit an exponential moving average of the weights
 
 # model card for any config (before training) or any finished run
 python model_summary.py --blocks 4 4 3 --width 64 --kernel 3
