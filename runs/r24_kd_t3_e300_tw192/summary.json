@@ -1,0 +1,88 @@
+{
+ "depth": 24,
+ "params": 4697162,
+ "best_epoch": 288,
+ "best_val_acc": 0.9741999506950378,
+ "epochs_run": 300,
+ "stopped_early": false,
+ "test_loss": 0.24737028777599335,
+ "test_acc": 0.9753999710083008,
+ "test_acc_tta": 0.9749999642372131,
+ "train_seconds": 2280.568769454956,
+ "split": {
+  "train": 40000,
+  "val": 5000,
+  "test": 5000
+ },
+ "teacher_val_acc": 0.9791999459266663,
+ "teacher_val_accs": [
+  0.977400004863739,
+  0.9769999980926514,
+  0.9729999899864197
+ ],
+ "kaggle_pred_counts": [
+  188,
+  218,
+  205,
+  199,
+  200,
+  211,
+  187,
+  198,
+  200,
+  194
+ ],
+ "kaggle_tta_changed": 43,
+ "args": {
+  "data": "/scratch/rl3725/deep_learning/project_1/data",
+  "out": "project_1/runs/r24_kd_t3_e300_tw192",
+  "blocks": [
+   4,
+   4,
+   3
+  ],
+  "width": 64,
+  "kernel": 3,
+  "epochs": 300,
+  "patience": 0,
+  "batch": 128,
+  "lr": 0.1,
+  "wd": 0.0005,
+  "warmup": 1.0,
+  "jitter": [
+   0.2,
+   0.2,
+   0.2
+  ],
+  "grayscale": 0.05,
+  "sharpness": 0.0,
+  "sharpness_prob": 0.5,
+  "randaugment": [
+   1,
+   9
+  ],
+  "zoom": [
+   1.0,
+   1.0
+  ],
+  "label_smoothing": 0.1,
+  "cutout": 16,
+  "mix": "cutmix",
+  "mix_alpha": 1.0,
+  "mix_prob": 1.0,
+  "teacher": [
+   "project_1/runs/teacher_w192/best.pt",
+   "project_1/runs/teacher_w192_s1/best.pt",
+   "project_1/runs/teacher_w192_s2/best.pt"
+  ],
+  "kd_alpha": 0.9,
+  "kd_temp": 4.0,
+  "teacher_over_limit": false,
+  "val_frac": 0.1,
+  "test_frac": 0.1,
+  "seed": 0,
+  "train_seed": 0,
+  "device": "cuda",
+  "smoke": false
+ }
+}

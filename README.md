@@ -153,6 +153,12 @@ local score by construction, so the held-out student is their paired estimate.
 | Student `r24_kd_t3_e300_zoom_full`, all 50k, 35 min | 4,697,162 | n/a | n/a | n/a | 0.904 |
 | Student `r24_kd_t3_e300_b453`, `--blocks 4 5 3`, 28 min | 4,992,586 | 97.42% | 97.32% | 97.42% | |
 | Student `r24_kd_t3_e300_b453_full`, all 50k, 35 min | 4,992,586 | n/a | n/a | n/a | 0.903 |
+| Teacher ensemble, w128 at 300 epochs (`runs/teacher_w128_e300*`) | 18.8M | 97.74% | | | never submitted |
+| Student `r24_kd_t3_e300_te300`, distilled from it | 4,697,162 | 97.44% | 97.46% | 97.58% | |
+| Student `r24_kd_t3_e300_te300_full`, all 50k | 4,697,162 | n/a | n/a | n/a | 0.898 |
+| Teacher ensemble, width 192, 42,206,410 params each (`runs/teacher_w192*`) | 42.2M | 97.92% | | | never submitted |
+| Student `r24_kd_t3_e300_tw192`, distilled from it | 4,697,162 | 97.42% | 97.54% | 97.50% | |
+| Student `r24_kd_t3_e300_tw192_full`, all 50k | 4,697,162 | n/a | n/a | n/a | 0.904 |
 
 The seed-0 teacher in `runs/teacher_w128` is the training the round-3 and round-4 students distilled
 from (its val accuracy is the first entry of `teacher_val_accs` in their `summary.json`). The round-2
@@ -171,6 +177,8 @@ How the rounds compare, same split and seed:
 | 4b | the same with 800 student epochs (`EPOCHS=800`, `runs/r24_kd_t3_e800*`) | 97.64% / 97.82% TTA | 0.899 |
 | 5a | round 4 + random zoom 0.7–1.4× for the student (`--zoom 0.7 1.4`) | 97.22% / 97.30% TTA | 0.904 |
 | 5b | round 4 with one more block in stage 2 (`--blocks 4 5 3`, 4,992,586 params) | 97.32% / 97.42% TTA | 0.903 |
+| 6a | round 4 with the teachers trained for 300 epochs (ensemble 97.74% val) | 97.46% / 97.58% TTA | 0.898 |
+| 6b | round 4 with width-192 teachers, 42.2M params each (ensemble 97.92% val) | 97.54% / 97.50% TTA | 0.904 |
 
 The student with flip TTA is level with the ensemble it was distilled from (97.64% vs 97.56%), so the
 teachers are now the ceiling. A longer schedule was the first thing tried (distillation keeps improving
@@ -183,7 +191,12 @@ Round 5 changed one thing at a time from the round-4 recipe (see [Fifth round](#
 random zoom, the augmentation suggested by the shift analysis below, and the only deeper block layout
 that still fits under 5M parameters. Each moved about 90 of the 2,000 Kaggle predictions and scored
 0.904 and 0.903, again inside the noise of the 0.907 entry. More parameters and scale augmentation
-do not close the gap either, so the round-4 student remains the selected submission.
+do not close the gap either. Round 6 attacked the ceiling instead: since the student had caught up
+with its teachers, the teachers were made stronger, by training them 50% longer or by making them 2.2×
+wider. The ensembles did improve, to 97.74% and 97.92% on val, but the students distilled from them
+stayed level with the round-4 student on the test split and scored 0.898 and 0.904. Seven submissions
+of this model family now span 0.897 to 0.907, a spread smaller than the sampling error of the hidden
+set and unrelated to the local numbers, so the round-4 student remains the selected submission.
 
 Two caveats when reading the Kaggle column. The hidden set has 2,000 images, so its standard error at
 90% is about 0.7 points: the steps above are real, but anything smaller is leaderboard noise, and the
@@ -307,6 +320,18 @@ Both are ties with the round-4 student on every number, so that is where the 4.7
 comes from: the last 6% of the budget buys nothing measurable, and the submitted model keeps the
 smaller layout. The pipeline accepts such variants as `SUFFIX` / `STUDENT_EXTRA` environment variables
 (see [NYU HPC](#nyu-hpc)); the teachers are reused, so a variant costs about one GPU hour.
+
+### Sixth round: stronger teachers
+
+The student matches its teacher ensemble, so the last lever is the ensemble itself. Two new sets of
+three teachers were trained with the pipeline's `TEACHER_EPOCHS` / `TEACHER_WIDTH` / `TEACHER_NAME`
+knobs, each job differing from round 4 only in its teachers: width 128 for 300 epochs instead of 200
+(`r24_kd_t3_e300_te300`), and width 192, 42.2M parameters, for 200 epochs (`r24_kd_t3_e300_tw192`).
+Both ensembles beat the round-4 one on val (97.74% and 97.92% vs 97.56%), and both students gained 0.2
+on val, but on the test split they are level with the round-4 student (97.46% / 97.58% TTA and 97.54%
+/ 97.50% TTA vs 97.42% / 97.64%) and scored 0.898 and 0.904 on Kaggle. The ceiling moved; the 4.70M
+student did not follow it, which marks the capacity of the student, not the teachers, as the limit at
+this budget.
 
 ## Usage
 
