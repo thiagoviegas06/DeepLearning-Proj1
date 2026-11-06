@@ -99,7 +99,7 @@ Blocks per stage (`--blocks`), base width (`--width`) and kernel size (`--kernel
 | Random grayscale | 5% of the student's training images (`--grayscale 0.05`): the Kaggle images are grayscale 3× as often as the training set |
 | SAM (optional) | off in the submitted model; `--sam 0.05` applies sharpness-aware minimization (Foret et al. 2021): the gradient is taken at the worst weights within radius 0.05 and applied to the original ones |
 | EMA (optional) | off in the submitted model; `--ema 0.9995` keeps an exponential moving average of the weights (Polyak averaging) and validates, checkpoints and submits that model |
-| Random zoom (optional) | off in the submitted model; `--zoom LO HI` rescales each image by a factor drawn from U(LO, HI) after the crop (tried as `--zoom 0.7 1.4` in round 5, see [Results](#results)) |
+| Random zoom (optional) | off in the submitted model; `--zoom LO HI` enlarges a random window of each image by a factor drawn from U(LO, HI) after the crop (RandomResizedCrop-style; factors below 1 shrink and zero-pad). Tried as `--zoom 0.7 1.4` in round 5, see [Results](#results) |
 | Distillation | three teachers, same architecture at width 128 (18,765,962 params, `--teacher-over-limit`), same data split, training seeds 0/1/2; the student matches their averaged logits with the Hinton KL loss at temperature 4, weight 0.9 (`--kd-alpha 0.9 --kd-temp 4`) |
 | Test-time augmentation | predictions averaged over the image and its mirror (`submission_tta.csv`) |
 | Cutout | one random 16×16 square per image zeroed after normalization (`--cutout 16`) |

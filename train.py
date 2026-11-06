@@ -244,14 +244,17 @@ def augment(x, pad=4):
 
 
 def zoom(x, lo, hi):
-    """Random scale per image, factor ~ U(lo, hi): > 1 enlarges the object (the border is cropped away),
-    < 1 shrinks it and zero-fills the margin (zero = channel mean after normalization). Bilinear
-    resampling about the image center through an affine grid. Motivated by the Kaggle images, whose
+    """Random scale per image, factor ~ U(lo, hi): > 1 enlarges a random window of the image to full size
+    (like RandomResizedCrop), < 1 shrinks it and zero-fills the margin (zero = channel mean after
+    normalization). Bilinear resampling through an affine grid, random window position. Motivated by the Kaggle images, whose
     objects are framed at more varied scales than CIFAR's (close-ups, small objects in a wide scene)."""
     n = x.shape[0]
     s = lo + (hi - lo) * torch.rand(n, device=x.device)
     theta = torch.zeros(n, 2, 3, device=x.device, dtype=x.dtype)
     theta[:, 0, 0] = theta[:, 1, 1] = 1 / s
+    # random position: when zooming in, the enlarged window lands anywhere inside the image (a close-up can be
+    # off-centre); when zooming out, the shrunk image lands anywhere inside the frame
+    theta[:, :, 2] = (2 * torch.rand(n, 2, device=x.device) - 1) * (1 - 1 / s).abs()[:, None]
     grid = F.affine_grid(theta, list(x.shape), align_corners=False)
     return F.grid_sample(x, grid, mode="bilinear", padding_mode="zeros", align_corners=False)
 
