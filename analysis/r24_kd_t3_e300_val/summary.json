@@ -1,0 +1,25 @@
+{
+ "run": "runs/r24_kd_t3_e300",
+ "split": "val",
+ "n_images": 5000,
+ "below_0.5": 99,
+ "below_0.7": 282,
+ "below_0.9": 4985,
+ "mean_confidence": 0.8205066323280334,
+ "pred_counts": {
+  "airplane": 501,
+  "automobile": 494,
+  "bird": 503,
+  "cat": 504,
+  "deer": 505,
+  "dog": 490,
+  "frog": 501,
+  "horse": 494,
+  "ship": 508,
+  "truck": 500
+ },
+ "accuracy": 0.9736,
+ "errors": 132,
+ "errors_among_below_0.7": 90,
+ "accuracy_above_0.9": 1.0
+}

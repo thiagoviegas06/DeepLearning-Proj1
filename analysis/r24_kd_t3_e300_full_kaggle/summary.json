@@ -1,0 +1,21 @@
+{
+ "run": "runs/r24_kd_t3_e300_full",
+ "split": "kaggle",
+ "n_images": 2000,
+ "below_0.5": 135,
+ "below_0.7": 302,
+ "below_0.9": 1994,
+ "mean_confidence": 0.7805044054985046,
+ "pred_counts": {
+  "airplane": 181,
+  "automobile": 219,
+  "bird": 213,
+  "cat": 196,
+  "deer": 193,
+  "dog": 205,
+  "frog": 193,
+  "horse": 199,
+  "ship": 206,
+  "truck": 195
+ }
+}
