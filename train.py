@@ -1,18 +1,40 @@
-"""Baseline ResNet with 5x5 convolutions for the Kaggle CIFAR-10 ResNet architecture challenge.
+"""CIFAR-style ResNet for the Kaggle CIFAR-10 ResNet architecture challenge (<= 5M parameters).
 
-Data (data/): 50,000 labeled 32x32 RGB training images (5,000 per class) and 2,000 unlabeled
-Kaggle test images. The labeled set is split per class into train / val / test (default
-35,000 / 7,500 / 7,500). Val picks the best epoch; the local test split is scored once at the end.
-The PNGs are decoded once into data/cache.npz, and the whole dataset lives on the device, with
-all augmentation (color jitter, rotation, crop + flip, cutout, mixup) done on the GPU.
+Depth, width and kernel size are flags; the default is the 5x5-conv ResNet-20 baseline (3.0M
+params). Data (data/): 50,000 labeled 32x32 RGB training images (5,000 per class) and 2,000
+unlabeled Kaggle test images. The labeled set is split per class into train / val / test (default
+40,000 / 5,000 / 5,000). Val picks the best epoch; the local test split is scored once at the end.
+With --val-frac 0 --test-frac 0 the model trains on all 50,000 and the last epoch is kept.
+The PNGs are decoded once into data/cache.npz, and the whole dataset lives on the device. All
+augmentation (color jitter, random grayscale, sharpness, RandAugment, flip, pad-and-crop, zoom, Cutout,
+Mixup / CutMix) runs on the GPU per batch. The local test split and the Kaggle images are scored both plain and with flip TTA.
 
-  .venv/bin/python kaggle_resnet_cifar10/train.py                       # 100 epochs, early stopping
-  .venv/bin/python kaggle_resnet_cifar10/train.py --smoke               # CPU check, tiny subset
-  .venv/bin/python kaggle_resnet_cifar10/train.py --blocks 2 2 2 --width 16
+Knowledge distillation: train a larger teacher first (it may exceed the 5M limit with
+--teacher-over-limit; it is never submitted), then train the student with --teacher TEACHER_RUN/best.pt.
+The teacher sees the same augmented batches and the student matches its softened predictions. Several
+teachers (--teacher A/best.pt B/best.pt ...) act as an ensemble: the student matches their averaged
+logits. Teachers that should differ only in their weights share the student's --seed (the data split)
+and get their own --train-seed.
 
-Writes OUT/history.json, summary.json, curves.png, best.pt and submission.csv (id,label).
+Sharpness-aware minimization (--sam RHO, Foret et al. 2021): each step first climbs to the worst
+weights within an L2 ball of radius RHO (one extra forward/backward), and applies the gradient taken
+there to the original weights, which steers training to flat minima. Doubles the time per epoch.
+Weight averaging (--ema DECAY): an exponential moving average of the weights is kept alongside the
+trained model and is what gets validated, checkpointed and submitted.
+
+  python train.py                                   # 5x5 ResNet-20 baseline, 100 epochs, early stopping
+  python train.py --smoke                           # CPU check, tiny subset
+  python train.py --blocks 4 4 3 --width 64 --kernel 3 --epochs 200 --patience 0 \
+                  --label-smoothing 0.1 --cutout 16 --mix cutmix     # 4.7M-param recipe
+  python train.py ... --width 128 --teacher-over-limit --out runs/teacher   # 18.8M-param teacher
+  python train.py ... --width 128 --teacher-over-limit --train-seed 1 --out runs/teacher_s1   # 2nd teacher, same split
+  python train.py ... --width 64 --teacher runs/teacher/best.pt runs/teacher_s1/best.pt      # student of the ensemble
+
+Writes OUT/history.json, summary.json, curves.png, best.pt, submission.csv and submission_tta.csv (id,label).
+Run `python model_summary.py --run OUT` afterwards for the layer table, parameter count and test accuracy.
 """
 import argparse
+import copy
 import csv
 import json
 import math
@@ -25,6 +47,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 HERE = Path(__file__).resolve().parent
+PARAM_LIMIT = 5_000_000  # competition rule: at most 5M trainable parameters
 
 
 def load_images(data_dir, cache):
@@ -123,26 +146,88 @@ def color_jitter(x, brightness, contrast, saturation):
     return x.clamp(0, 1)
 
 
-def rotate(x, degrees):
-    """Rotate each image by an angle drawn from U(-degrees, degrees), filling corners with zeros."""
-    n, dev = x.shape[0], x.device
-    theta = math.radians(degrees) * (2 * torch.rand(n, device=dev) - 1)
-    cos, sin, zero = theta.cos(), theta.sin(), torch.zeros(n, device=dev)
-    mat = torch.stack([torch.stack([cos, -sin, zero], 1), torch.stack([sin, cos, zero], 1)], 1)
-    grid = F.affine_grid(mat, list(x.shape), align_corners=False)
-    return F.grid_sample(x, grid, mode="bilinear", padding_mode="zeros", align_corners=False)
+def random_grayscale(x, prob):
+    """Like torchvision's RandomGrayscale on [0, 1] pixels: with probability `prob` per image, replace the
+    three channels by their luminance."""
+    g = (x * torch.tensor([0.299, 0.587, 0.114], device=x.device)[:, None, None]).sum(1, keepdim=True)
+    apply = torch.rand(x.shape[0], device=x.device) < prob
+    return torch.where(apply[:, None, None, None], g.expand_as(x), x)
 
 
-def cutout(x, size):
-    """Zero one size x size square per image, centered anywhere in the image (so it may be clipped)."""
+def sharpen(x, factor, prob):
+    """Like torchvision's RandomAdjustSharpness on [0, 1] pixels: with probability `prob` per image,
+    blend it with a 3x3-smoothed copy, out = blur + factor * (x - blur), so factor > 1 sharpens.
+    Border pixels are left unsmoothed, as in torchvision."""
+    k = torch.tensor([[1., 1., 1.], [1., 5., 1.], [1., 1., 1.]], device=x.device) / 13
+    blur = x.clone()
+    blur[:, :, 1:-1, 1:-1] = F.conv2d(x, k.expand(x.shape[1], 1, 3, 3), groups=x.shape[1])
+    out = (blur + factor * (x - blur)).clamp(0, 1)
+    apply = torch.rand(x.shape[0], device=x.device) < prob
+    return torch.where(apply[:, None, None, None], out, x)
+
+
+def equalize(x):
+    """Per-image, per-channel histogram equalization of [0, 1] pixels, as in torchvision's equalize."""
+    v = (x * 255).round().long().flatten(2)
+    hist = torch.zeros(*v.shape[:2], 256, dtype=torch.long, device=x.device).scatter_add_(2, v, torch.ones_like(v))
+    last = hist.gather(2, ((hist > 0) * torch.arange(256, device=x.device)).argmax(2, keepdim=True))
+    step = (hist.sum(2, keepdim=True) - last) // 255
+    lut = (hist.cumsum(2) + step // 2) // step.clamp(min=1)
+    lut = torch.cat([torch.zeros_like(lut[..., :1]), lut[..., :-1]], 2).clamp(0, 255)
+    out = lut.gather(2, v).view_as(x).float() / 255
+    return torch.where(step[..., None] == 0, x, out)
+
+
+def rand_augment(x, n_ops, magnitude, bins=31):
+    """RandAugment (Cubuk et al., 2020) on [0, 1] pixels with torchvision's 14 ops and magnitude scales:
+    `n_ops` rounds, each applying an op drawn uniformly and independently per image, at `magnitude`
+    out of bins - 1 (9 of 30 is the usual CIFAR setting), with a random sign for the signed ops.
+    Geometric ops fill uncovered pixels with black, like torchvision."""
     n, _, h, w = x.shape
     dev = x.device
-    cy = torch.randint(0, h, (n, 1, 1), device=dev)
-    cx = torch.randint(0, w, (n, 1, 1), device=dev)
-    ys = torch.arange(h, device=dev)[None, :, None] - cy + size // 2
-    xs = torch.arange(w, device=dev)[None, None, :] - cx + size // 2
-    keep = ~((ys >= 0) & (ys < size) & (xs >= 0) & (xs < size))
-    return x * keep[:, None]
+    m = magnitude / (bins - 1)
+    gray = lambda t: (t * torch.tensor([0.299, 0.587, 0.114], device=dev)[:, None, None]).sum(1, keepdim=True)
+    blend = lambda a, b, f: (b + f * (a - b)).clamp(0, 1)  # f = 1 keeps a, f = 0 gives b
+    for _ in range(n_ops):
+        op = torch.randint(0, 14, (n,), device=dev)
+        sign = torch.where(torch.rand(n, device=dev) < 0.5, -1.0, 1.0)
+        # 0-4 geometric: shear x, shear y, translate x, translate y, rotate, as one affine resample
+        theta = torch.eye(2, 3, device=dev).repeat(n, 1, 1)
+        shear, shift, angle = 0.3 * m * sign, 2 * (150 / 331) * m * sign, math.radians(30 * m) * sign
+        theta[:, 0, 1] = torch.where(op == 0, shear, theta[:, 0, 1])
+        theta[:, 1, 0] = torch.where(op == 1, shear, theta[:, 1, 0])
+        theta[:, 0, 2] = torch.where(op == 2, shift, theta[:, 0, 2])
+        theta[:, 1, 2] = torch.where(op == 3, shift, theta[:, 1, 2])
+        rot = op == 4
+        theta[rot, :, :2] = torch.stack([torch.stack([angle.cos(), -angle.sin()], 1),
+                                         torch.stack([angle.sin(), angle.cos()], 1)], 1)[rot]
+        geo = op <= 4
+        if geo.any():
+            grid = F.affine_grid(theta[geo], [int(geo.sum()), *x.shape[1:]], align_corners=False)
+            x[geo] = F.grid_sample(x[geo], grid, mode="bilinear", padding_mode="zeros", align_corners=False)
+        # 5-8 brightness, color, contrast, sharpness: factor 1 +- 0.9 m
+        f = (1 + 0.9 * m * sign)[:, None, None, None]
+        color_ops = {5: lambda t, f: blend(t, torch.zeros_like(t), f),
+                     6: lambda t, f: blend(t, gray(t), f),
+                     7: lambda t, f: blend(t, gray(t).mean((2, 3), keepdim=True), f),
+                     8: lambda t, f: sharpen(t, f, 1.0)}
+        for k, fn in color_ops.items():
+            sel = op == k
+            if sel.any():
+                x[sel] = fn(x[sel], f[sel])
+        # 9 posterize, 10 solarize, 11 autocontrast, 12 equalize, 13 identity
+        bits = 8 - int(round(m * 4))
+        level = 2 ** (8 - bits)
+        lo, hi = x.amin((2, 3), keepdim=True), x.amax((2, 3), keepdim=True)
+        other_ops = {9: lambda t, lo, hi: torch.floor((t * 255).round() / level) * level / 255,
+                     10: lambda t, lo, hi: torch.where(t >= 1 - m, 1 - t, t),
+                     11: lambda t, lo, hi: torch.where(hi > lo, (t - lo) / (hi - lo).clamp(min=1e-8), t),
+                     12: lambda t, lo, hi: equalize(t)}
+        for k, fn in other_ops.items():
+            sel = op == k
+            if sel.any():
+                x[sel] = fn(x[sel], lo[sel], hi[sel])
+    return x
 
 
 def augment(x, pad=4):
@@ -158,26 +243,135 @@ def augment(x, pad=4):
              rows[:, None, :, None], cols[:, None, None, :]]
 
 
-@torch.no_grad()
-def evaluate(model, x, y, batch, amp):
-    model.eval()
-    loss, correct = 0.0, 0
-    for i in range(0, len(x), batch):
-        with torch.autocast(x.device.type, dtype=torch.bfloat16, enabled=amp):
-            logits = model(x[i:i + batch]).float()
-        loss += F.cross_entropy(logits, y[i:i + batch], reduction="sum").item()
-        correct += (logits.argmax(1) == y[i:i + batch]).sum().item()
-    return loss / len(x), correct / len(x)
+def zoom(x, lo, hi):
+    """Random scale per image, factor ~ U(lo, hi): > 1 enlarges a random window of the image to full size
+    (like RandomResizedCrop), < 1 shrinks it and zero-fills the margin (zero = channel mean after
+    normalization). Bilinear resampling through an affine grid, random window position. Motivated by the Kaggle images, whose
+    objects are framed at more varied scales than CIFAR's (close-ups, small objects in a wide scene)."""
+    n = x.shape[0]
+    s = lo + (hi - lo) * torch.rand(n, device=x.device)
+    theta = torch.zeros(n, 2, 3, device=x.device, dtype=x.dtype)
+    theta[:, 0, 0] = theta[:, 1, 1] = 1 / s
+    # random position: when zooming in, the enlarged window lands anywhere inside the image (a close-up can be
+    # off-centre); when zooming out, the shrunk image lands anywhere inside the frame
+    theta[:, :, 2] = (2 * torch.rand(n, 2, device=x.device) - 1) * (1 - 1 / s).abs()[:, None]
+    grid = F.affine_grid(theta, list(x.shape), align_corners=False)
+    return F.grid_sample(x, grid, mode="bilinear", padding_mode="zeros", align_corners=False)
+
+
+def cutout(x, size):
+    """Cutout (DeVries & Taylor, 2017): zero one size x size square per image, centered at a uniform
+    random pixel so it may be clipped by the border. Applied after normalization, so zero is the
+    per-channel mean."""
+    n, _, h, w = x.shape
+    dev = x.device
+    cy = torch.randint(0, h, (n, 1, 1), device=dev)
+    cx = torch.randint(0, w, (n, 1, 1), device=dev)
+    ys = torch.arange(h, device=dev)[None, :, None]
+    xs = torch.arange(w, device=dev)[None, None, :]
+    hole = (ys >= cy - size // 2) & (ys < cy + size // 2) & (xs >= cx - size // 2) & (xs < cx + size // 2)
+    return x.masked_fill(hole[:, None], 0.0)
+
+
+def mix_batch(x, y, mode, alpha):
+    """Mixup (Zhang et al., 2018) or CutMix (Yun et al., 2019) with one lambda ~ Beta(alpha, alpha)
+    per batch, pairing each image with a shuffled partner. Returns (x_mixed, y_a, y_b, lam); the
+    loss is lam * CE(y_a) + (1 - lam) * CE(y_b)."""
+    n, _, h, w = x.shape
+    perm = torch.randperm(n, device=x.device)
+    lam = torch.distributions.Beta(alpha, alpha).sample().item()
+    if mode == "mixup":
+        return lam * x + (1 - lam) * x[perm], y, y[perm], lam
+    # cutmix: paste a random box of the partner image whose area is (1 - lam) of the image,
+    # then set lam to the exact unpasted fraction (the box can be clipped by the border).
+    rh, rw = int(h * math.sqrt(1 - lam)), int(w * math.sqrt(1 - lam))
+    cy, cx = torch.randint(0, h, (1,)).item(), torch.randint(0, w, (1,)).item()
+    y1, y2 = max(cy - rh // 2, 0), min(cy + rh // 2, h)
+    x1, x2 = max(cx - rw // 2, 0), min(cx + rw // 2, w)
+    x = x.clone()
+    x[:, :, y1:y2, x1:x2] = x[perm, :, y1:y2, x1:x2]
+    return x, y, y[perm], 1 - (y2 - y1) * (x2 - x1) / (h * w)
 
 
 @torch.no_grad()
-def predict(model, x, batch, amp):
+def logits_of(model, x, batch, amp, tta=False):
+    """Logits for x in batches; with tta, the average of the logits of each image and its mirror."""
     model.eval()
     out = []
     for i in range(0, len(x), batch):
+        xb = x[i:i + batch]
         with torch.autocast(x.device.type, dtype=torch.bfloat16, enabled=amp):
-            out.append(model(x[i:i + batch]).argmax(1))
+            z = model(xb).float()
+            if tta:
+                z = (z + model(xb.flip(3)).float()) / 2
+        out.append(z)
     return torch.cat(out)
+
+
+def evaluate(model, x, y, batch, amp, tta=False):
+    """(mean cross-entropy, accuracy); (nan, nan) for an empty split."""
+    if len(x) == 0:
+        return float("nan"), float("nan")
+    logits = logits_of(model, x, batch, amp, tta)
+    return F.cross_entropy(logits, y).item(), (logits.argmax(1) == y).float().mean().item()
+
+
+def predict(model, x, batch, amp, tta=False):
+    return logits_of(model, x, batch, amp, tta).argmax(1)
+
+
+def write_submission(path, ids, preds):
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["id", "label"])
+        w.writerows(zip(ids.tolist(), preds.tolist()))
+
+
+def load_run(path, dev):
+    """(model in eval mode, checkpoint dict) from a best.pt written by this script."""
+    ckpt = torch.load(path, map_location=dev)
+    a = ckpt["args"]
+    model = ResNet(tuple(a["blocks"]), a["width"], a["kernel"]).to(dev).to(memory_format=torch.channels_last)
+    model.load_state_dict(ckpt["model"])
+    return model.eval(), ckpt
+
+
+def sam_perturb(params, rho):
+    """Move each parameter to w + rho * g / ||g|| (g = current grads, one global norm) and return the offsets."""
+    grads = [q.grad for q in params if q.grad is not None]
+    scale = rho / (torch.norm(torch.stack([g.norm(2) for g in grads]), 2) + 1e-12)
+    offsets = []
+    with torch.no_grad():
+        for q in params:
+            e = q.grad * scale if q.grad is not None else None
+            if e is not None:
+                q.add_(e)
+            offsets.append(e)
+    return offsets
+
+
+def sam_restore(params, offsets):
+    with torch.no_grad():
+        for q, e in zip(params, offsets):
+            if e is not None:
+                q.sub_(e)
+
+
+def set_bn_momentum(model, value):
+    """Set every BatchNorm's momentum (0 freezes the running stats); returns the previous values."""
+    prev = []
+    for m in model.modules():
+        if isinstance(m, torch.nn.modules.batchnorm._BatchNorm):
+            prev.append((m, m.momentum))
+            m.momentum = value
+    return prev
+
+
+def kd_loss(student_logits, teacher_logits, temp):
+    """Hinton et al. (2015) distillation loss: KL(teacher || student) on temperature-softened
+    distributions, scaled by temp^2 so its gradients stay comparable to the cross-entropy's."""
+    return F.kl_div(F.log_softmax(student_logits / temp, 1), F.log_softmax(teacher_logits / temp, 1),
+                    reduction="batchmean", log_target=True) * temp ** 2
 
 
 def plot(history, path):
@@ -206,8 +400,7 @@ def main():
     p.add_argument("--out", type=Path, default=HERE / "runs" / "baseline")
     p.add_argument("--blocks", type=int, nargs="+", default=[3, 3, 3], help="basic blocks per stage")
     p.add_argument("--width", type=int, default=32, help="channels in the first stage")
-    p.add_argument("--kernel", type=int, default=5)
-    p.add_argument("--max-params", type=int, default=5_000_000, help="refuse larger models (0 = no limit)")
+    p.add_argument("--kernel", type=int, default=5, help="conv kernel size in the stem and every block")
     p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--patience", type=int, default=20,
                    help="stop after this many epochs without a new best val accuracy (0 = off)")
@@ -217,18 +410,52 @@ def main():
     p.add_argument("--warmup", type=float, default=1.0, help="linear warmup, in epochs")
     p.add_argument("--jitter", type=float, nargs=3, default=[0.2, 0.2, 0.2], metavar=("B", "C", "S"),
                    help="color jitter strength for brightness, contrast, saturation (0 0 0 = off)")
-    p.add_argument("--rotate", type=float, default=0.0, help="max random rotation in degrees (0 = off)")
-    p.add_argument("--cutout", type=int, default=0, help="side of the square cut out of each image (0 = off)")
-    p.add_argument("--mixup", type=float, default=0.0, help="mixup Beta(a, a) parameter (0 = off)")
-    p.add_argument("--label-smoothing", type=float, default=0.0)
-    p.add_argument("--val-frac", type=float, default=0.15)
-    p.add_argument("--test-frac", type=float, default=0.15)
-    p.add_argument("--seed", type=int, default=0, help="seeds both the split and training")
+    p.add_argument("--grayscale", type=float, default=0.0,
+                   help="probability that a training image is converted to grayscale (0 = off)")
+    p.add_argument("--sharpness", type=float, default=0.0,
+                   help="sharpness factor for random sharpening, e.g. 2.0 (0 = off)")
+    p.add_argument("--sharpness-prob", type=float, default=0.5, help="probability that an image is sharpened")
+    p.add_argument("--randaugment", type=int, nargs=2, default=[0, 0], metavar=("N", "M"),
+                   help="RandAugment: N ops per image at magnitude M of 30 (e.g. 2 9; 0 0 = off)")
+    p.add_argument("--zoom", type=float, nargs=2, default=[1.0, 1.0], metavar=("LO", "HI"),
+                   help="random scale factor per training image, uniform in [LO, HI] (e.g. 0.7 1.4; 1 1 = off)")
+    p.add_argument("--teacher-unzoomed", action="store_true",
+                   help="with --zoom and --teacher: the teachers score the batch before the zoom (same flip, crop, "
+                        "Cutout and CutMix), so the student learns the whole-object prediction from a close-up")
+    p.add_argument("--label-smoothing", type=float, default=0.0, help="cross-entropy label smoothing (0 = off)")
+    p.add_argument("--cutout", type=int, default=0,
+                   help="side of the square hole Cutout zeroes in each training image (0 = off; 16 is standard for CIFAR)")
+    p.add_argument("--mix", choices=["none", "mixup", "cutmix"], default="none", help="batch mixing augmentation")
+    p.add_argument("--mix-alpha", type=float, default=1.0, help="mixing weight lambda ~ Beta(alpha, alpha)")
+    p.add_argument("--mix-prob", type=float, default=1.0, help="probability that a batch is mixed")
+    p.add_argument("--teacher", type=Path, nargs="+",
+                   help="best.pt of one or more trained teacher runs to distill from; several are averaged (ensemble)")
+    p.add_argument("--kd-alpha", type=float, default=0.9,
+                   help="weight of the distillation loss; the label loss gets 1 - alpha")
+    p.add_argument("--kd-temp", type=float, default=4.0, help="distillation softmax temperature")
+    p.add_argument("--sam", type=float, default=0.0,
+                   help="sharpness-aware minimization with neighbourhood radius RHO (0 = off; 0.05 is the CIFAR value)")
+    p.add_argument("--ema", type=float, default=0.0,
+                   help="keep an exponential moving average of the weights with this per-step decay and evaluate / "
+                        "save that model instead (0 = off; 0.9995 spans the last ~6 epochs at 313 steps/epoch)")
+    p.add_argument("--teacher-over-limit", action="store_true",
+                   help="allow more than 5M params; only for training a distillation teacher, never for submission")
+    p.add_argument("--val-frac", type=float, default=0.1, help="0 = no val split; the last epoch is kept")
+    p.add_argument("--test-frac", type=float, default=0.1)
+    p.add_argument("--seed", type=int, default=0, help="seeds the split and, unless --train-seed is set, training")
+    p.add_argument("--train-seed", type=int, default=None,
+                   help="seed for the weights and the training randomness; defaults to --seed. Use it to train "
+                        "several teachers on the same split")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--smoke", action="store_true", help="1 epoch on 1,000 train images, tiny eval sets")
     args = p.parse_args()
     if args.smoke:
         args.epochs = 1
+    has_val = args.val_frac > 0
+    if args.train_seed is None:
+        args.train_seed = args.seed
+    as_json = lambda v: [str(x) for x in v] if isinstance(v, list) and v and isinstance(v[0], Path) else str(v) if isinstance(v, Path) else v
+    saved_args = {k: as_json(v) for k, v in vars(args).items()}  # for best.pt and summary.json
 
     t0 = time.time()
     x_all, y_all, x_kaggle, kaggle_ids = load_images(args.data, args.data / "cache.npz")
@@ -248,16 +475,58 @@ def main():
     x_val, x_test, x_kag = (norm(to_float(a)) for a in (x_all[va], x_all[te], x_kaggle))
     y_train, y_val, y_test = (torch.from_numpy(y_all[i]).to(dev) for i in (tr, va, te))
 
-    torch.manual_seed(args.seed)
-    rng = np.random.default_rng(args.seed)  # mixup coefficients
+    torch.manual_seed(args.train_seed)
     model = ResNet(tuple(args.blocks), args.width, args.kernel).to(dev).to(memory_format=torch.channels_last)
     n_params = sum(q.numel() for q in model.parameters())
     depth = 2 * sum(args.blocks) + 2
     print(f"model: ResNet-{depth}, {args.kernel}x{args.kernel} convs, blocks {args.blocks}, "
           f"width {args.width}, {n_params:,} params, device {dev}")
-    if args.max_params and n_params > args.max_params:
-        raise SystemExit(f"{n_params:,} params exceeds --max-params {args.max_params:,}")
+    if n_params > PARAM_LIMIT and not args.teacher_over_limit:
+        raise SystemExit(f"{n_params:,} parameters exceeds the competition limit of {PARAM_LIMIT:,}")
+    if n_params > PARAM_LIMIT:
+        print(f"TEACHER RUN: {n_params:,} params, over the {PARAM_LIMIT:,} limit; do not submit its predictions")
+    criterion = lambda logits, y: F.cross_entropy(logits, y, label_smoothing=args.label_smoothing)
 
+    teachers = []  # (model, to_teacher) pairs; the student matches their averaged logits
+    if args.teacher:
+        for path in args.teacher:
+            # summary.json is written only when a run finishes, so this refuses a teacher that is still training
+            t_summary = path.parent / "summary.json"
+            if not t_summary.exists():
+                raise SystemExit(f"{t_summary} not found: the teacher run has not finished")
+            with torch.random.fork_rng(devices=[]):  # building the teacher must not shift the training RNG stream
+                teacher, t_ckpt = load_run(path, dev)
+            if t_ckpt["epoch"] != json.loads(t_summary.read_text())["best_epoch"]:
+                raise SystemExit(f"{path} is not the final best checkpoint in {t_summary}")
+            for q in teacher.parameters():
+                q.requires_grad_(False)
+            # the student's batches are normalized with the student's stats; re-normalize for the teacher
+            t_mean, t_std = t_ckpt["mean"].to(dev), t_ckpt["std"].to(dev)
+            to_teacher = lambda x, m=t_mean, sd=t_std: (x * std + mean - m) / sd
+            ta = t_ckpt["args"]
+            if has_val and (ta["val_frac"], ta["test_frac"], ta["seed"]) != (args.val_frac, args.test_frac, args.seed):
+                print(f"WARNING: teacher {path} used a different split, so it may have trained on this run's val / "
+                      "test images and the local scores will be optimistic")
+            _, acc = evaluate(teacher, to_teacher(x_val), y_val, 1000, amp)
+            print(f"teacher: {path}, ResNet-{2 * sum(ta['blocks']) + 2} width {ta['width']}, "
+                  f"{sum(q.numel() for q in teacher.parameters()):,} params, train seed {ta.get('train_seed', ta['seed'])}, "
+                  f"val acc {acc:.4f}")
+            teachers.append((teacher, to_teacher, acc))
+
+    def teacher_logits(xb):
+        """Average of the teachers' logits on the student's (normalized) batch."""
+        return torch.stack([t(tt(xb)).float() for t, tt, _ in teachers]).mean(0)
+
+    t_val_acc, t_val_accs = float("nan"), [acc for _, _, acc in teachers]
+    if teachers and has_val:
+        with torch.no_grad(), torch.autocast(dev.type, dtype=torch.bfloat16, enabled=amp):
+            ens = torch.cat([teacher_logits(x_val[i:i + 1000]) for i in range(0, len(x_val), 1000)])
+        t_val_acc = (ens.argmax(1) == y_val).float().mean().item()
+    if teachers:
+        print(f"distilling from {len(teachers)} teacher(s), ensemble val acc {t_val_acc:.4f}; "
+              f"kd alpha {args.kd_alpha}, temp {args.kd_temp}")
+
+    params = list(model.parameters())
     decay = [q for q in model.parameters() if q.ndim > 1]
     no_decay = [q for q in model.parameters() if q.ndim <= 1]
     opt = torch.optim.SGD([{"params": decay, "weight_decay": args.wd}, {"params": no_decay, "weight_decay": 0.0}],
@@ -266,6 +535,13 @@ def main():
     total, warm = args.epochs * steps_per_epoch, round(args.warmup * steps_per_epoch)
     sched = torch.optim.lr_scheduler.LambdaLR(
         opt, lambda s: (s + 1) / warm if s < warm else 0.5 * (1 + math.cos(math.pi * (s - warm) / max(1, total - warm))))
+
+    ema_model, ema_steps = None, 0
+    if args.ema:
+        ema_model = copy.deepcopy(model).eval()
+        for q in ema_model.parameters():
+            q.requires_grad_(False)
+    eval_model = ema_model if args.ema else model  # the model that is validated, checkpointed and scored
 
     args.out.mkdir(parents=True, exist_ok=True)
     history, best_acc, best_epoch, stopped_early, train_start = [], -1.0, 0, False, time.time()
@@ -277,42 +553,76 @@ def main():
         correct = torch.zeros((), device=dev)
         for i in range(0, len(perm), args.batch):
             idx = perm[i:i + args.batch]
-            xb = norm(color_jitter(x_train[idx], *args.jitter))
-            if args.rotate:
-                xb = rotate(xb, args.rotate)
-            xb = augment(xb)
+            # jitter + grayscale + sharpness + RandAugment on [0, 1] pixels -> normalize -> flip + crop -> Cutout -> Mixup / CutMix
+            xb = color_jitter(x_train[idx], *args.jitter)
+            if args.grayscale:
+                xb = random_grayscale(xb, args.grayscale)
+            if args.sharpness:
+                xb = sharpen(xb, args.sharpness, args.sharpness_prob)
+            if args.randaugment[0]:
+                xb = rand_augment(xb, *args.randaugment)
+            xb = augment(norm(xb))
+            if args.zoom != [1.0, 1.0]:
+                # with --teacher-unzoomed the plain view rides along as channels 3:6 so that Cutout and CutMix
+                # (which act on all channels alike) hit both views identically; split again below
+                xb = torch.cat([zoom(xb, *args.zoom), xb], 1) if teachers and args.teacher_unzoomed else zoom(xb, *args.zoom)
             if args.cutout:
                 xb = cutout(xb, args.cutout)
-            yb = y_train[idx]
-            lam, yb2 = 1.0, yb
-            if args.mixup:
-                lam = float(rng.beta(args.mixup, args.mixup))
-                mix = torch.randperm(len(idx), device=dev)
-                xb, yb2 = lam * xb + (1 - lam) * xb[mix], yb[mix]
+            ya = yb = y_train[idx]
+            lam = 1.0
+            if args.mix != "none" and torch.rand(()).item() < args.mix_prob:
+                xb, ya, yb, lam = mix_batch(xb, ya, args.mix, args.mix_alpha)
+            xb_teacher = xb
+            if xb.shape[1] == 6:
+                xb, xb_teacher = xb[:, :3], xb[:, 3:]
             xb = xb.contiguous(memory_format=torch.channels_last)
-            with torch.autocast(dev.type, dtype=torch.bfloat16, enabled=amp):
-                logits = model(xb)
-            ce = lambda t: F.cross_entropy(logits.float(), t, label_smoothing=args.label_smoothing)
-            loss = lam * ce(yb) + (1 - lam) * ce(yb2) if args.mixup else ce(yb)
-            if lam < 0.5:
-                yb = yb2  # train accuracy counts the dominant label of each mixed pair
+            if teachers:  # the targets do not depend on the student's weights: computed once per batch
+                with torch.no_grad(), torch.autocast(dev.type, dtype=torch.bfloat16, enabled=amp):
+                    t_logits = teacher_logits(xb_teacher.contiguous(memory_format=torch.channels_last))
+
+            def forward_loss():
+                with torch.autocast(dev.type, dtype=torch.bfloat16, enabled=amp):
+                    logits = model(xb).float()
+                loss = criterion(logits, ya) if lam == 1.0 else lam * criterion(logits, ya) + (1 - lam) * criterion(logits, yb)
+                if teachers:
+                    loss = (1 - args.kd_alpha) * loss + args.kd_alpha * kd_loss(logits, t_logits, args.kd_temp)
+                return logits, loss
+
+            logits, loss = forward_loss()
             opt.zero_grad(set_to_none=True)
             loss.backward()
+            if args.sam:  # SAM: gradient at the worst nearby weights, applied to the original weights
+                offsets = sam_perturb(params, args.sam)
+                opt.zero_grad(set_to_none=True)
+                prev_momentum = set_bn_momentum(model, 0.0)  # BN running stats come from the first pass only
+                forward_loss()[1].backward()
+                for m, mom in prev_momentum:
+                    m.momentum = mom
+                sam_restore(params, offsets)
             opt.step()
             sched.step()
+            if ema_model is not None:
+                ema_steps += 1
+                d = min(args.ema, (1 + ema_steps) / (10 + ema_steps))  # warm start: short average early on
+                with torch.no_grad():
+                    for k, v in model.state_dict().items():
+                        e = ema_model.state_dict()[k]
+                        e.mul_(d).add_(v, alpha=1 - d) if v.dtype.is_floating_point else e.copy_(v)
             loss_sum += loss.detach() * len(idx)
-            correct += (logits.argmax(1) == yb).sum()
-        val_loss, val_acc = evaluate(model, x_val, y_val, 1000, amp)
+            pred = logits.argmax(1)  # on a mixed batch, credit each image's two labels by their weights
+            correct += lam * (pred == ya).sum() + (1 - lam) * (pred == yb).sum()
+        val_loss, val_acc = evaluate(eval_model, x_val, y_val, 1000, amp)
         h = {"epoch": epoch, "train_loss": loss_sum.item() / len(x_train), "train_acc": correct.item() / len(x_train),
              "val_loss": val_loss, "val_acc": val_acc, "lr": opt.param_groups[0]["lr"], "seconds": time.time() - t_ep}
+        if ema_model is not None:  # the raw (non-averaged) model's val accuracy, for comparison
+            h["val_acc_raw"] = evaluate(model, x_val, y_val, 1000, amp)[1]
         history.append(h)
-        if val_acc > best_acc:
+        if not has_val or val_acc > best_acc:  # without val, every epoch overwrites best.pt
             best_acc, best_epoch = val_acc, epoch
-            torch.save({"model": model.state_dict(), "epoch": epoch, "args": vars(args) | {"data": str(args.data),
-                        "out": str(args.out)}, "mean": mean.cpu(), "std": std.cpu()}, args.out / "best.pt")
+            torch.save({"model": eval_model.state_dict(), "epoch": epoch, "args": saved_args, "mean": mean.cpu(), "std": std.cpu()}, args.out / "best.pt")
         print(f"epoch {epoch:3d}  train {h['train_loss']:.4f} / {h['train_acc']:.4f}  "
               f"val {val_loss:.4f} / {val_acc:.4f}  lr {h['lr']:.4f}  {h['seconds']:.1f}s", flush=True)
-        if args.patience and epoch - best_epoch >= args.patience:
+        if has_val and args.patience and epoch - best_epoch >= args.patience:
             stopped_early = True
             print(f"early stop: no val improvement in {args.patience} epochs (best epoch {best_epoch})")
             break
@@ -321,22 +631,27 @@ def main():
     best = torch.load(args.out / "best.pt", map_location=dev)
     model.load_state_dict(best["model"])
     test_loss, test_acc = evaluate(model, x_test, y_test, 1000, amp)
+    _, test_acc_tta = evaluate(model, x_test, y_test, 1000, amp, tta=True)
     preds = predict(model, x_kag, 1000, amp).cpu().numpy()
-    with open(args.out / "submission.csv", "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["id", "label"])
-        w.writerows(zip(kaggle_ids.tolist(), preds.tolist()))
+    preds_tta = predict(model, x_kag, 1000, amp, tta=True).cpu().numpy()
+    write_submission(args.out / "submission.csv", kaggle_ids, preds)
+    write_submission(args.out / "submission_tta.csv", kaggle_ids, preds_tta)
 
-    summary = {"depth": depth, "params": n_params, "best_epoch": best["epoch"], "best_val_acc": best_acc,
-               "epochs_run": len(history), "stopped_early": stopped_early,
-               "test_loss": test_loss, "test_acc": test_acc, "train_seconds": train_seconds,
+    nan_to_none = lambda v: None if math.isnan(v) else v
+    summary = {"depth": depth, "params": n_params, "best_epoch": best["epoch"],
+               "best_val_acc": best_acc if has_val else None, "epochs_run": len(history), "stopped_early": stopped_early,
+               "test_loss": nan_to_none(test_loss), "test_acc": nan_to_none(test_acc),
+               "test_acc_tta": nan_to_none(test_acc_tta), "train_seconds": train_seconds,
                "split": {"train": len(tr), "val": len(va), "test": len(te)},
+               "teacher_val_acc": nan_to_none(t_val_acc) if teachers else None,
+               "teacher_val_accs": [nan_to_none(a) for a in t_val_accs] if teachers else None,
                "kaggle_pred_counts": np.bincount(preds, minlength=10).tolist(),
-               "args": vars(args) | {"data": str(args.data), "out": str(args.out)}}
+               "kaggle_tta_changed": int((preds != preds_tta).sum()),
+               "args": saved_args}
     (args.out / "history.json").write_text(json.dumps(history, indent=1))
     (args.out / "summary.json").write_text(json.dumps(summary, indent=1))
     plot(history, args.out / "curves.png")
-    print(f"best epoch {best['epoch']}: val {best_acc:.4f}  local test {test_acc:.4f}  "
+    print(f"best epoch {best['epoch']}: val {best_acc if has_val else float('nan'):.4f}  local test {test_acc:.4f} / {test_acc_tta:.4f} with TTA  "
           f"({train_seconds:.0f}s training) -> {args.out}")
 
 

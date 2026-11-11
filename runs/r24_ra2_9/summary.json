@@ -1,0 +1,68 @@
+{
+ "depth": 24,
+ "params": 4697162,
+ "best_epoch": 187,
+ "best_val_acc": 0.9666000008583069,
+ "epochs_run": 200,
+ "stopped_early": false,
+ "test_loss": 0.2812238335609436,
+ "test_acc": 0.9675999879837036,
+ "test_acc_tta": 0.968999981880188,
+ "train_seconds": 1275.1136622428894,
+ "split": {
+  "train": 40000,
+  "val": 5000,
+  "test": 5000
+ },
+ "kaggle_pred_counts": [
+  180,
+  217,
+  210,
+  192,
+  191,
+  224,
+  191,
+  195,
+  205,
+  195
+ ],
+ "kaggle_tta_changed": 67,
+ "args": {
+  "data": "/scratch/tjv235/deep_learning/kaggle_resnet_cifar10/data",
+  "out": "kaggle_resnet_cifar10/runs/r24_ra2_9",
+  "blocks": [
+   4,
+   4,
+   3
+  ],
+  "width": 64,
+  "kernel": 3,
+  "epochs": 200,
+  "patience": 0,
+  "batch": 128,
+  "lr": 0.1,
+  "wd": 0.0005,
+  "warmup": 1.0,
+  "jitter": [
+   0.2,
+   0.2,
+   0.2
+  ],
+  "sharpness": 0.0,
+  "sharpness_prob": 0.5,
+  "randaugment": [
+   2,
+   9
+  ],
+  "label_smoothing": 0.1,
+  "cutout": 16,
+  "mix": "cutmix",
+  "mix_alpha": 1.0,
+  "mix_prob": 1.0,
+  "val_frac": 0.1,
+  "test_frac": 0.1,
+  "seed": 0,
+  "device": "cuda",
+  "smoke": false
+ }
+}
