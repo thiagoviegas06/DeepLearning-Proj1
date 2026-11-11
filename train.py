@@ -419,6 +419,9 @@ def main():
                    help="RandAugment: N ops per image at magnitude M of 30 (e.g. 2 9; 0 0 = off)")
     p.add_argument("--zoom", type=float, nargs=2, default=[1.0, 1.0], metavar=("LO", "HI"),
                    help="random scale factor per training image, uniform in [LO, HI] (e.g. 0.7 1.4; 1 1 = off)")
+    p.add_argument("--teacher-unzoomed", action="store_true",
+                   help="with --zoom and --teacher: the teachers score the batch before the zoom (same flip, crop, "
+                        "Cutout and CutMix), so the student learns the whole-object prediction from a close-up")
     p.add_argument("--label-smoothing", type=float, default=0.0, help="cross-entropy label smoothing (0 = off)")
     p.add_argument("--cutout", type=int, default=0,
                    help="side of the square hole Cutout zeroes in each training image (0 = off; 16 is standard for CIFAR)")
@@ -560,17 +563,22 @@ def main():
                 xb = rand_augment(xb, *args.randaugment)
             xb = augment(norm(xb))
             if args.zoom != [1.0, 1.0]:
-                xb = zoom(xb, *args.zoom)
+                # with --teacher-unzoomed the plain view rides along as channels 3:6 so that Cutout and CutMix
+                # (which act on all channels alike) hit both views identically; split again below
+                xb = torch.cat([zoom(xb, *args.zoom), xb], 1) if teachers and args.teacher_unzoomed else zoom(xb, *args.zoom)
             if args.cutout:
                 xb = cutout(xb, args.cutout)
             ya = yb = y_train[idx]
             lam = 1.0
             if args.mix != "none" and torch.rand(()).item() < args.mix_prob:
                 xb, ya, yb, lam = mix_batch(xb, ya, args.mix, args.mix_alpha)
+            xb_teacher = xb
+            if xb.shape[1] == 6:
+                xb, xb_teacher = xb[:, :3], xb[:, 3:]
             xb = xb.contiguous(memory_format=torch.channels_last)
             if teachers:  # the targets do not depend on the student's weights: computed once per batch
                 with torch.no_grad(), torch.autocast(dev.type, dtype=torch.bfloat16, enabled=amp):
-                    t_logits = teacher_logits(xb)
+                    t_logits = teacher_logits(xb_teacher.contiguous(memory_format=torch.channels_last))
 
             def forward_loss():
                 with torch.autocast(dev.type, dtype=torch.bfloat16, enabled=amp):

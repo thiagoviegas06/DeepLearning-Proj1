@@ -33,7 +33,7 @@
 set -euo pipefail
 ROOT="${ROOT:-/scratch/rl3725/deep_learning}"
 REPO="${REPO:-project_1}"
-SIF="${SIF:-/scratch/work/public/singularity/cuda12.1.1-cudnn8.9.0-devel-ubuntu22.04.2.sif}"
+SIF="${SIF:-/share/apps/images/cuda12.1.1-cudnn8.9.0-devel-ubuntu22.04.2.sif}"
 OVERLAY="${OVERLAY:-$ROOT/overlay-15GB-500K.ext3}"
 STAMP="$(date +%Y%m%d_%H%M%S)"   # job start time; the Slurm job id is echoed below for cross-reference
 OUT="${OUT:-$ROOT/$REPO/runs/$STAMP}"
