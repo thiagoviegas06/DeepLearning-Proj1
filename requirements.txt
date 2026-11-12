@@ -1,0 +1,16 @@
+# Python 3.9+ (3.12 used locally and on the NYU HPC). Install with: pip install -r requirements.txt
+# `pip install torch` picks a CUDA build on Linux and an MPS (Apple GPU) build on macOS; for a
+# specific CUDA version use the selector at https://pytorch.org/get-started/locally/
+
+# train.py, model_summary.py, predict.py, inspect_predictions.py
+torch>=2.1
+numpy>=1.24
+pillow>=9.0
+matplotlib>=3.7
+
+# optional: independent cross-check of the parameter count in model_summary.py
+torchinfo>=1.8
+
+# notebooks (train_notebook.ipynb, train_pipeline.ipynb)
+jupyter
+ipykernel
