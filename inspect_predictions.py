@@ -33,12 +33,15 @@ CLASSES = ["airplane", "automobile", "bird", "cat", "deer", "dog", "frog", "hors
 
 
 def pick_device(name):
+    """torch.device for `name`, or the best available one (CUDA > MPS > CPU) when name is empty."""
     if name:
         return torch.device(name)
     return torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
 
 
 def main():
+    """Score the chosen split with flip TTA, rank the images least confident first and write the review
+    sheet (low_confidence.csv, confidence_hist.png, page_NN.png, summary.json) to --out."""
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--run", type=Path, required=True, help="run directory holding best.pt and summary.json")
     p.add_argument("--data", type=Path, default=HERE / "data")
@@ -72,7 +75,7 @@ def main():
     order = np.argsort(probs, 1)[:, ::-1]
     pred, second = order[:, 0], order[:, 1]
     conf, p2 = probs[np.arange(len(probs)), pred], probs[np.arange(len(probs)), second]
-    rank = np.argsort(conf)  # least confident first
+    rank = np.argsort(conf)
 
     with open(out / "low_confidence.csv", "w", newline="") as f:
         w = csv.writer(f)

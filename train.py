@@ -47,7 +47,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 HERE = Path(__file__).resolve().parent
-PARAM_LIMIT = 5_000_000  # competition rule: at most 5M trainable parameters
+PARAM_LIMIT = 5_000_000
 
 
 def load_images(data_dir, cache):
@@ -58,6 +58,7 @@ def load_images(data_dir, cache):
     from PIL import Image
 
     def read(folder, names):
+        """Stack the PNGs in `folder` named by `names` into one uint8 NHWC array."""
         return np.stack([np.asarray(Image.open(folder / n).convert("RGB")) for n in names])
 
     with open(data_dir / "train_labels.csv") as f:
@@ -89,7 +90,11 @@ def stratified_split(y, val_frac, test_frac, seed):
 
 
 class BasicBlock(nn.Module):
+    """Two-conv residual block: conv-BN-ReLU, conv-BN, add the shortcut, ReLU. The shortcut is the
+    identity when the shape is unchanged and a strided 1x1 conv + BN otherwise."""
+
     def __init__(self, cin, cout, kernel, stride):
+        """Block from `cin` to `cout` channels with `kernel` x `kernel` convs; `stride` applies to the first conv."""
         super().__init__()
         pad = kernel // 2
         self.conv1 = nn.Conv2d(cin, cout, kernel, stride, pad, bias=False)
@@ -102,6 +107,7 @@ class BasicBlock(nn.Module):
             self.shortcut = nn.Sequential(nn.Conv2d(cin, cout, 1, stride, bias=False), nn.BatchNorm2d(cout))
 
     def forward(self, x):
+        """Residual branch plus shortcut, followed by ReLU."""
         out = F.relu(self.bn1(self.conv1(x)))
         out = self.bn2(self.conv2(out))
         return F.relu(out + self.shortcut(x))
@@ -112,6 +118,7 @@ class ResNet(nn.Module):
     resolution halves after the first), global average pool, linear. Depth = 2*sum(blocks) + 2."""
 
     def __init__(self, blocks=(3, 3, 3), width=32, kernel=5, num_classes=10):
+        """Build the stem, the residual stages (`blocks[i]` blocks at width * 2**i) and the classifier."""
         super().__init__()
         self.stem = nn.Sequential(nn.Conv2d(3, width, kernel, 1, kernel // 2, bias=False),
                                   nn.BatchNorm2d(width), nn.ReLU())
@@ -125,6 +132,7 @@ class ResNet(nn.Module):
         self.fc = nn.Linear(cin, num_classes)
 
     def forward(self, x):
+        """Stem, residual stages, global average pool, classifier; returns logits."""
         x = self.layers(self.stem(x))
         return self.fc(torch.flatten(F.adaptive_avg_pool2d(x, 1), 1))
 
@@ -182,16 +190,19 @@ def rand_augment(x, n_ops, magnitude, bins=31):
     """RandAugment (Cubuk et al., 2020) on [0, 1] pixels with torchvision's 14 ops and magnitude scales:
     `n_ops` rounds, each applying an op drawn uniformly and independently per image, at `magnitude`
     out of bins - 1 (9 of 30 is the usual CIFAR setting), with a random sign for the signed ops.
-    Geometric ops fill uncovered pixels with black, like torchvision."""
+    Geometric ops fill uncovered pixels with black, like torchvision.
+
+    Ops by index: 0-4 shear x, shear y, translate x, translate y, rotate (applied as one affine resample);
+    5-8 brightness, color, contrast, sharpness (blend factor 1 +- 0.9 m, where blend(a, b, f) returns a at
+    f = 1 and b at f = 0); 9 posterize, 10 solarize, 11 autocontrast, 12 equalize, 13 identity."""
     n, _, h, w = x.shape
     dev = x.device
     m = magnitude / (bins - 1)
     gray = lambda t: (t * torch.tensor([0.299, 0.587, 0.114], device=dev)[:, None, None]).sum(1, keepdim=True)
-    blend = lambda a, b, f: (b + f * (a - b)).clamp(0, 1)  # f = 1 keeps a, f = 0 gives b
+    blend = lambda a, b, f: (b + f * (a - b)).clamp(0, 1)
     for _ in range(n_ops):
         op = torch.randint(0, 14, (n,), device=dev)
         sign = torch.where(torch.rand(n, device=dev) < 0.5, -1.0, 1.0)
-        # 0-4 geometric: shear x, shear y, translate x, translate y, rotate, as one affine resample
         theta = torch.eye(2, 3, device=dev).repeat(n, 1, 1)
         shear, shift, angle = 0.3 * m * sign, 2 * (150 / 331) * m * sign, math.radians(30 * m) * sign
         theta[:, 0, 1] = torch.where(op == 0, shear, theta[:, 0, 1])
@@ -205,7 +216,6 @@ def rand_augment(x, n_ops, magnitude, bins=31):
         if geo.any():
             grid = F.affine_grid(theta[geo], [int(geo.sum()), *x.shape[1:]], align_corners=False)
             x[geo] = F.grid_sample(x[geo], grid, mode="bilinear", padding_mode="zeros", align_corners=False)
-        # 5-8 brightness, color, contrast, sharpness: factor 1 +- 0.9 m
         f = (1 + 0.9 * m * sign)[:, None, None, None]
         color_ops = {5: lambda t, f: blend(t, torch.zeros_like(t), f),
                      6: lambda t, f: blend(t, gray(t), f),
@@ -215,7 +225,6 @@ def rand_augment(x, n_ops, magnitude, bins=31):
             sel = op == k
             if sel.any():
                 x[sel] = fn(x[sel], f[sel])
-        # 9 posterize, 10 solarize, 11 autocontrast, 12 equalize, 13 identity
         bits = 8 - int(round(m * 4))
         level = 2 ** (8 - bits)
         lo, hi = x.amin((2, 3), keepdim=True), x.amax((2, 3), keepdim=True)
@@ -247,13 +256,13 @@ def zoom(x, lo, hi):
     """Random scale per image, factor ~ U(lo, hi): > 1 enlarges a random window of the image to full size
     (like RandomResizedCrop), < 1 shrinks it and zero-fills the margin (zero = channel mean after
     normalization). Bilinear resampling through an affine grid, random window position. Motivated by the Kaggle images, whose
-    objects are framed at more varied scales than CIFAR's (close-ups, small objects in a wide scene)."""
+    objects are framed at more varied scales than CIFAR's (close-ups, small objects in a wide scene).
+    When zooming in, the enlarged window lands anywhere inside the image (a close-up can be off-centre);
+    when zooming out, the shrunk image lands anywhere inside the frame."""
     n = x.shape[0]
     s = lo + (hi - lo) * torch.rand(n, device=x.device)
     theta = torch.zeros(n, 2, 3, device=x.device, dtype=x.dtype)
     theta[:, 0, 0] = theta[:, 1, 1] = 1 / s
-    # random position: when zooming in, the enlarged window lands anywhere inside the image (a close-up can be
-    # off-centre); when zooming out, the shrunk image lands anywhere inside the frame
     theta[:, :, 2] = (2 * torch.rand(n, 2, device=x.device) - 1) * (1 - 1 / s).abs()[:, None]
     grid = F.affine_grid(theta, list(x.shape), align_corners=False)
     return F.grid_sample(x, grid, mode="bilinear", padding_mode="zeros", align_corners=False)
@@ -276,14 +285,14 @@ def cutout(x, size):
 def mix_batch(x, y, mode, alpha):
     """Mixup (Zhang et al., 2018) or CutMix (Yun et al., 2019) with one lambda ~ Beta(alpha, alpha)
     per batch, pairing each image with a shuffled partner. Returns (x_mixed, y_a, y_b, lam); the
-    loss is lam * CE(y_a) + (1 - lam) * CE(y_b)."""
+    loss is lam * CE(y_a) + (1 - lam) * CE(y_b). CutMix pastes a random box of the partner image whose
+    area is (1 - lam) of the image, then sets lam to the exact unpasted fraction (the box can be clipped
+    by the border)."""
     n, _, h, w = x.shape
     perm = torch.randperm(n, device=x.device)
     lam = torch.distributions.Beta(alpha, alpha).sample().item()
     if mode == "mixup":
         return lam * x + (1 - lam) * x[perm], y, y[perm], lam
-    # cutmix: paste a random box of the partner image whose area is (1 - lam) of the image,
-    # then set lam to the exact unpasted fraction (the box can be clipped by the border).
     rh, rw = int(h * math.sqrt(1 - lam)), int(w * math.sqrt(1 - lam))
     cy, cx = torch.randint(0, h, (1,)).item(), torch.randint(0, w, (1,)).item()
     y1, y2 = max(cy - rh // 2, 0), min(cy + rh // 2, h)
@@ -317,10 +326,12 @@ def evaluate(model, x, y, batch, amp, tta=False):
 
 
 def predict(model, x, batch, amp, tta=False):
+    """Predicted class per image: the argmax of `logits_of`."""
     return logits_of(model, x, batch, amp, tta).argmax(1)
 
 
 def write_submission(path, ids, preds):
+    """Write a Kaggle submission CSV with the header id,label."""
     with open(path, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["id", "label"])
@@ -351,6 +362,7 @@ def sam_perturb(params, rho):
 
 
 def sam_restore(params, offsets):
+    """Undo `sam_perturb`: subtract the offsets it returned from the parameters."""
     with torch.no_grad():
         for q, e in zip(params, offsets):
             if e is not None:
@@ -375,6 +387,7 @@ def kd_loss(student_logits, teacher_logits, temp):
 
 
 def plot(history, path):
+    """Save the training curves (train / val loss and accuracy per epoch) as a PNG at `path`."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -395,6 +408,25 @@ def plot(history, path):
 
 
 def main():
+    """Parse the flags, train one run and write its outputs to --out.
+
+    Per batch the training pipeline is color jitter -> grayscale -> sharpness -> RandAugment on [0, 1]
+    pixels -> normalize -> flip + crop -> zoom -> Cutout -> Mixup / CutMix; x_train is kept in [0, 1] so
+    the color ops run before normalization. With --teacher-unzoomed the unzoomed view rides along as
+    channels 3:6 so that Cutout and CutMix (which act on all channels alike) hit both views identically,
+    and is split off again before the forward pass.
+
+    Teachers are loaded inside a forked RNG so building them does not shift the training RNG stream, and
+    a teacher is refused if its run has no summary.json yet (still training) or if its best.pt is not the
+    checkpoint summary.json names. Their logits are computed once per batch (the targets do not depend on
+    the student's weights), after re-normalizing the batch with each teacher's own mean / std.
+
+    With --sam the gradient taken at the perturbed weights is applied to the original weights; BN
+    momentum is 0 on the second pass so the running stats come from the first. With --ema the averaged
+    model (warm-started decay) is the one validated, checkpointed and scored, and history.json also
+    records the raw model's val_acc_raw. On a mixed batch the logged train accuracy credits each image's
+    two labels by their weights. Without a val split every epoch overwrites best.pt, so it is the last
+    epoch. The saved args are JSON-friendly copies (Paths as strings) for best.pt and summary.json."""
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--data", type=Path, default=HERE / "data")
     p.add_argument("--out", type=Path, default=HERE / "runs" / "baseline")
@@ -455,7 +487,7 @@ def main():
     if args.train_seed is None:
         args.train_seed = args.seed
     as_json = lambda v: [str(x) for x in v] if isinstance(v, list) and v and isinstance(v[0], Path) else str(v) if isinstance(v, Path) else v
-    saved_args = {k: as_json(v) for k, v in vars(args).items()}  # for best.pt and summary.json
+    saved_args = {k: as_json(v) for k, v in vars(args).items()}
 
     t0 = time.time()
     x_all, y_all, x_kaggle, kaggle_ids = load_images(args.data, args.data / "cache.npz")
@@ -471,7 +503,7 @@ def main():
     x_train = to_float(x_all[tr])
     mean = x_train.mean((0, 2, 3), keepdim=True)
     std = x_train.std((0, 2, 3), keepdim=True)
-    norm = lambda x: (x - mean) / std  # x_train stays in [0, 1] so color jitter can run before normalizing
+    norm = lambda x: (x - mean) / std
     x_val, x_test, x_kag = (norm(to_float(a)) for a in (x_all[va], x_all[te], x_kaggle))
     y_train, y_val, y_test = (torch.from_numpy(y_all[i]).to(dev) for i in (tr, va, te))
 
@@ -487,20 +519,18 @@ def main():
         print(f"TEACHER RUN: {n_params:,} params, over the {PARAM_LIMIT:,} limit; do not submit its predictions")
     criterion = lambda logits, y: F.cross_entropy(logits, y, label_smoothing=args.label_smoothing)
 
-    teachers = []  # (model, to_teacher) pairs; the student matches their averaged logits
+    teachers = []
     if args.teacher:
         for path in args.teacher:
-            # summary.json is written only when a run finishes, so this refuses a teacher that is still training
             t_summary = path.parent / "summary.json"
             if not t_summary.exists():
                 raise SystemExit(f"{t_summary} not found: the teacher run has not finished")
-            with torch.random.fork_rng(devices=[]):  # building the teacher must not shift the training RNG stream
+            with torch.random.fork_rng(devices=[]):
                 teacher, t_ckpt = load_run(path, dev)
             if t_ckpt["epoch"] != json.loads(t_summary.read_text())["best_epoch"]:
                 raise SystemExit(f"{path} is not the final best checkpoint in {t_summary}")
             for q in teacher.parameters():
                 q.requires_grad_(False)
-            # the student's batches are normalized with the student's stats; re-normalize for the teacher
             t_mean, t_std = t_ckpt["mean"].to(dev), t_ckpt["std"].to(dev)
             to_teacher = lambda x, m=t_mean, sd=t_std: (x * std + mean - m) / sd
             ta = t_ckpt["args"]
@@ -541,7 +571,7 @@ def main():
         ema_model = copy.deepcopy(model).eval()
         for q in ema_model.parameters():
             q.requires_grad_(False)
-    eval_model = ema_model if args.ema else model  # the model that is validated, checkpointed and scored
+    eval_model = ema_model if args.ema else model
 
     args.out.mkdir(parents=True, exist_ok=True)
     history, best_acc, best_epoch, stopped_early, train_start = [], -1.0, 0, False, time.time()
@@ -553,7 +583,6 @@ def main():
         correct = torch.zeros((), device=dev)
         for i in range(0, len(perm), args.batch):
             idx = perm[i:i + args.batch]
-            # jitter + grayscale + sharpness + RandAugment on [0, 1] pixels -> normalize -> flip + crop -> Cutout -> Mixup / CutMix
             xb = color_jitter(x_train[idx], *args.jitter)
             if args.grayscale:
                 xb = random_grayscale(xb, args.grayscale)
@@ -563,8 +592,6 @@ def main():
                 xb = rand_augment(xb, *args.randaugment)
             xb = augment(norm(xb))
             if args.zoom != [1.0, 1.0]:
-                # with --teacher-unzoomed the plain view rides along as channels 3:6 so that Cutout and CutMix
-                # (which act on all channels alike) hit both views identically; split again below
                 xb = torch.cat([zoom(xb, *args.zoom), xb], 1) if teachers and args.teacher_unzoomed else zoom(xb, *args.zoom)
             if args.cutout:
                 xb = cutout(xb, args.cutout)
@@ -576,11 +603,13 @@ def main():
             if xb.shape[1] == 6:
                 xb, xb_teacher = xb[:, :3], xb[:, 3:]
             xb = xb.contiguous(memory_format=torch.channels_last)
-            if teachers:  # the targets do not depend on the student's weights: computed once per batch
+            if teachers:
                 with torch.no_grad(), torch.autocast(dev.type, dtype=torch.bfloat16, enabled=amp):
                     t_logits = teacher_logits(xb_teacher.contiguous(memory_format=torch.channels_last))
 
             def forward_loss():
+                """Student forward pass and its loss: the (mixed) label cross-entropy, blended with the
+                distillation loss when there are teachers. Returns (logits, loss)."""
                 with torch.autocast(dev.type, dtype=torch.bfloat16, enabled=amp):
                     logits = model(xb).float()
                 loss = criterion(logits, ya) if lam == 1.0 else lam * criterion(logits, ya) + (1 - lam) * criterion(logits, yb)
@@ -591,10 +620,10 @@ def main():
             logits, loss = forward_loss()
             opt.zero_grad(set_to_none=True)
             loss.backward()
-            if args.sam:  # SAM: gradient at the worst nearby weights, applied to the original weights
+            if args.sam:
                 offsets = sam_perturb(params, args.sam)
                 opt.zero_grad(set_to_none=True)
-                prev_momentum = set_bn_momentum(model, 0.0)  # BN running stats come from the first pass only
+                prev_momentum = set_bn_momentum(model, 0.0)
                 forward_loss()[1].backward()
                 for m, mom in prev_momentum:
                     m.momentum = mom
@@ -603,21 +632,21 @@ def main():
             sched.step()
             if ema_model is not None:
                 ema_steps += 1
-                d = min(args.ema, (1 + ema_steps) / (10 + ema_steps))  # warm start: short average early on
+                d = min(args.ema, (1 + ema_steps) / (10 + ema_steps))
                 with torch.no_grad():
                     for k, v in model.state_dict().items():
                         e = ema_model.state_dict()[k]
                         e.mul_(d).add_(v, alpha=1 - d) if v.dtype.is_floating_point else e.copy_(v)
             loss_sum += loss.detach() * len(idx)
-            pred = logits.argmax(1)  # on a mixed batch, credit each image's two labels by their weights
+            pred = logits.argmax(1)
             correct += lam * (pred == ya).sum() + (1 - lam) * (pred == yb).sum()
         val_loss, val_acc = evaluate(eval_model, x_val, y_val, 1000, amp)
         h = {"epoch": epoch, "train_loss": loss_sum.item() / len(x_train), "train_acc": correct.item() / len(x_train),
              "val_loss": val_loss, "val_acc": val_acc, "lr": opt.param_groups[0]["lr"], "seconds": time.time() - t_ep}
-        if ema_model is not None:  # the raw (non-averaged) model's val accuracy, for comparison
+        if ema_model is not None:
             h["val_acc_raw"] = evaluate(model, x_val, y_val, 1000, amp)[1]
         history.append(h)
-        if not has_val or val_acc > best_acc:  # without val, every epoch overwrites best.pt
+        if not has_val or val_acc > best_acc:
             best_acc, best_epoch = val_acc, epoch
             torch.save({"model": eval_model.state_dict(), "epoch": epoch, "args": saved_args, "mean": mean.cpu(), "std": std.cpu()}, args.out / "best.pt")
         print(f"epoch {epoch:3d}  train {h['train_loss']:.4f} / {h['train_acc']:.4f}  "

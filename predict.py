@@ -17,6 +17,8 @@ import train
 
 
 def main():
+    """Rebuild a run's model and split from its checkpoint, print the local test accuracy plain and with
+    flip TTA, and write submission_tta.csv next to best.pt."""
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--run", type=Path, required=True, help="run directory with best.pt")
     p.add_argument("--data", type=Path, help="data directory (default: the one saved in the checkpoint)")

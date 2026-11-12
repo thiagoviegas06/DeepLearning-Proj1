@@ -40,6 +40,7 @@ def layer_table(model, input_size=INPUT_SIZE):
     rows, hooks = [], []
 
     def describe(mod):
+        """One-line description of a stem, BasicBlock or classifier module."""
         if isinstance(mod, train.BasicBlock):
             k = mod.conv1.kernel_size[0]
             proj = "1x1 projection" if not isinstance(mod.shortcut, torch.nn.Identity) else "identity"
@@ -52,7 +53,10 @@ def layer_table(model, input_size=INPUT_SIZE):
         return f"stem: Conv {k}x{k} {conv.in_channels}->{conv.out_channels} + BN + ReLU"
 
     def hook(name, mod):
+        """Register a forward hook on `mod` that appends its row (name, description, output shape,
+        parameter count) to `rows`; returns the hook handle."""
         def fn(_, __, out):
+            """Forward hook: record the module's row from its output tensor."""
             rows.append({"name": name, "layer": describe(mod), "output": list(out.shape),
                          "params": sum(p.numel() for p in mod.parameters())})
         return mod.register_forward_hook(fn)
@@ -72,6 +76,7 @@ def layer_table(model, input_size=INPUT_SIZE):
 
 
 def build(blocks, width, kernel):
+    """Construct the ResNet for a config: blocks per stage, first-stage width, conv kernel size."""
     return train.ResNet(tuple(blocks), width, kernel)
 
 
@@ -130,6 +135,7 @@ def report(blocks=None, width=None, kernel=None, run=None, torchinfo=True):
 
 
 def main():
+    """Command-line entry point: print the model card for a config or a finished run."""
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--blocks", type=int, nargs="+", help="basic blocks per stage (default: run's or 3 3 3)")
     p.add_argument("--width", type=int, help="channels in the first stage (default: run's or 32)")
